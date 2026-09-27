@@ -50,9 +50,9 @@ class Recorder:
 
 def resource(handler=None, *, per_second=100.0, burst=100, **kw):
     handler = handler or Recorder()
-    return ZunoResource(
-        as_api(FakeModuleApi()), RateLimiter(per_second, burst), handler, routes=ROUTES, **kw
-    ), handler
+    # Frozen clock: nothing refills between requests, so retry_after_ms is exact.
+    limiter = RateLimiter(per_second, burst, clock=lambda: 0.0)
+    return ZunoResource(as_api(FakeModuleApi()), limiter, handler, routes=ROUTES, **kw), handler
 
 
 async def expect_error(res, req, code, errcode):
