@@ -1,0 +1,85 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zuno-calls"
+version = "0.1.0"
+description = "Synapse module: Cloudflare Calls signaling proxy and TURN credentials for Zuno Chat"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.12"
+# matrix-synapse is not a dependency: the module runs inside Synapse's own
+# environment, which supplies it. Dev installs pin the deployed version.
+dependencies = [
+  "Twisted>=24.0",
+  "prometheus-client>=0.19",
+]
+
+[project.optional-dependencies]
+dev = [
+  # Track the deployed image; move together with tests/e2e/Dockerfile and the
+  # docker repo's synapse/Dockerfile FROM.
+  "matrix-synapse==1.161.0",
+  "Twisted==25.5.0",
+  "pytest>=8",
+  "pytest-twisted>=1.14",
+  "pytest-cov>=5",
+  "ruff>=0.6",
+  "mypy>=1.11",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zuno_calls"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not e2e'"
+markers = ["e2e: needs Docker; run with make e2e"]
+filterwarnings = [
+  "error",
+  "ignore::DeprecationWarning:twisted.web.static",
+  "ignore::DeprecationWarning:synapse.api.filtering",
+  "ignore::DeprecationWarning:synapse.http.connectproxyclient",
+]
+
+[tool.coverage.run]
+source = ["zuno_calls"]
+branch = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["zuno_calls.resource"]
+disallow_subclassing_any = false
+
+# Tests only: the fakes and Twisted's servers are built without annotations.
+# Duck-typed arguments go through the casts in conftest, so arg-type stays on.
+# mypy matches whole module components only, so the names are listed.
+[[tool.mypy.overrides]]
+module = [
+  "conftest",
+  "test_config",
+  "test_e2e",
+  "test_module",
+  "test_ratelimit",
+  "test_resource",
+  "test_sfu",
+  "test_turn",
+  "test_upstream",
+]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+disallow_any_generics = false
