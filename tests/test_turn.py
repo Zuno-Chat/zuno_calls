@@ -65,8 +65,8 @@ async def test_wired_resource_accepts_only_post_at_the_root():
     )
     for method, path in (("GET", []), ("POST", ["extra"]), ("PUT", [])):
         with pytest.raises(SynapseError) as exc:
-            await res._serve(authed(method, path))
+            await res._async_render(authed(method, path))
         assert exc.value.code == 404
     req = authed("POST", [], b'{"ttl":5}')
-    await res._serve(req)
+    await res._async_render(req)
     assert req.code == 200 and len(upstream.calls) == 1

@@ -111,13 +111,9 @@ class ZunoResource(DirectServeJsonResource):
         self._max_body = max_body
 
     async def _async_render(self, request: Any) -> None:
-        # Override the base dispatcher outright (rather than defining
-        # _async_render_GET/POST/PUT) so every unsupported verb reaches
-        # _serve and gets the same 404 M_UNRECOGNIZED as an unmatched path,
-        # instead of the base class's 405 for a method with no handler.
-        await self._serve(request)
-
-    async def _serve(self, request: Any) -> None:
+        # Overrides the base dispatcher outright (rather than defining
+        # _async_render_GET/POST/PUT) so an unsupported verb gets the same 404
+        # M_UNRECOGNIZED as an unmatched path, never the base class's 405.
         method = request.method.decode("ascii")
         segments = tuple(seg.decode("utf-8", "replace") for seg in request.postpath)
         if not match(self._routes, method, segments, self._reserved):

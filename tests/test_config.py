@@ -72,6 +72,22 @@ def test_secret_file_with_invalid_utf8(tmp_path):
     assert "app_secret_path" in message
 
 
+def test_secret_file_holding_only_a_newline_is_empty(tmp_path):
+    # What `echo "$UNSET" > file` writes.
+    (tmp_path / "secret").write_text("\n")
+    secret_path = str(tmp_path / "secret")
+    with pytest.raises(ConfigError, match="app_secret_path: .* is empty"):
+        parse_config(
+            {
+                "cloudflare": {
+                    **FULL["cloudflare"],
+                    "app_secret": None,
+                    "app_secret_path": secret_path,
+                }
+            }
+        )
+
+
 def test_overrides_are_parsed():
     cfg = parse_config(
         {
@@ -121,6 +137,8 @@ def test_overrides_are_parsed():
         ({"cloudflare": {**FULL["cloudflare"], "turn_credential_ttl": 0}}, ["turn_credential_ttl"]),
         ({"cloudflare": {**FULL["cloudflare"], "base_url": "cf.test"}}, ["base_url"]),
         ({**FULL, "rate_limit": {"per_second": 0, "burst": 0}}, ["per_second", "burst"]),
+        ({**FULL, "rate_limit": {"per_second": float("nan")}}, ["per_second"]),
+        ({"cloudflare": {**FULL["cloudflare"], "timeout": float("nan")}}, ["timeout"]),
         ({**FULL, "bogus": 1, "rate_limit": {"nope": 1}}, ["'bogus'", "'nope'"]),
         ({"cloudflare": {**FULL["cloudflare"], "extra": 1}}, ["'extra'"]),
         ({"cloudflare": "nope"}, ["cloudflare must be a map"]),
@@ -157,7 +175,9 @@ def test_parse_duration(value, seconds):
     assert parse_duration(value) == seconds
 
 
-@pytest.mark.parametrize("value", ["", "abc", "-1s", "1w", True, None, -1])
+@pytest.mark.parametrize(
+    "value", ["", "abc", "-1s", "1w", True, None, -1, float("nan"), float("inf")]
+)
 def test_parse_duration_rejects(value):
     with pytest.raises(ValueError):
         parse_duration(value)

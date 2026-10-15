@@ -93,15 +93,8 @@ class _Collector(Protocol):
         self.deferred: Deferred[bytes] = Deferred(self._cancel)
 
     def _drop(self) -> None:
-        # deliverBody hands a body protocol a TransportProxyProducer, which has
-        # no abortConnection, so loseConnection is the effective path today;
-        # abortConnection is tried first only in case of a richer transport.
-        transport = self.transport
-        for name in ("abortConnection", "loseConnection", "stopProducing"):
-            method = getattr(transport, name, None)
-            if method is not None:
-                method()
-                return
+        # deliverBody hands a body protocol a TransportProxyProducer.
+        self.transport.loseConnection()  # type: ignore[union-attr,misc]
 
     def _cancel(self, _: Deferred[bytes]) -> None:
         self._drop()

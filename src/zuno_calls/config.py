@@ -6,6 +6,7 @@ with the complete list rather than one item per restart.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,8 +61,8 @@ def parse_duration(value: object) -> float:
     if isinstance(value, bool):
         raise ValueError(f"not a duration: {value!r}")
     if isinstance(value, (int, float)):
-        if value < 0:
-            raise ValueError(f"negative duration: {value!r}")
+        if not 0 <= value < math.inf:  # also refuses nan
+            raise ValueError(f"not a finite, non-negative duration: {value!r}")
         return float(value)
     if isinstance(value, str):
         m = _DURATION.match(value.strip())
@@ -182,8 +183,12 @@ def _parse_rate_limit(section: Any, errors: list[str]) -> RateLimitConfig:
         errors.append(f"rate_limit: unknown key {key!r}")
     per_second = section.get("per_second", defaults.per_second)
     burst = section.get("burst", defaults.burst)
-    if isinstance(per_second, bool) or not isinstance(per_second, (int, float)) or per_second <= 0:
-        errors.append("rate_limit: per_second must be a positive number")
+    if (
+        isinstance(per_second, bool)
+        or not isinstance(per_second, (int, float))
+        or not 0 < per_second < math.inf
+    ):
+        errors.append("rate_limit: per_second must be a finite, positive number")
     if isinstance(burst, bool) or not isinstance(burst, int) or burst < 1:
         errors.append("rate_limit: burst must be an integer of at least 1")
     if len(errors) > before:

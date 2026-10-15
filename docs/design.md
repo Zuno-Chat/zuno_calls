@@ -22,9 +22,10 @@ The backend is named in the path so a LiveKit backend lands beside it (`.../call
 2. Auth: `api.get_user_by_req`; Synapse's own 401s. Rate key is (user, device), user alone for tokens without a device.
 3. Rate limit: token bucket per key; over is 429 `M_LIMIT_EXCEEDED` with `retry_after_ms`, Cloudflare never called.
 4. SFU path check: every segment `[A-Za-z0-9_-]{1,128}`, else 400 `M_INVALID_PARAM` — every other bad segment.
-5. Body: SFU reads up to 256 KB, over is 413 `M_TOO_LARGE`; TURN ignores its body (the TTL is config).
-6. Upstream: SFU one attempt, bearer App Secret, client Content-Type relayed; TURN `{"ttl": turn_credential_ttl}`, bearer API token, two retries with backoff on connect failure, timeout, 5xx or 429.
-7. Relay: Cloudflare's status, Content-Type and body byte-for-byte. Unavailable is 502 `M_UNKNOWN` "calls service unavailable".
+5. SFU session owner: a `{sessionId}` must be one this user opened through `sessions/new` on this process, else 404 `M_NOT_FOUND`, the same as a session that never existed. Call participants learn each other's ids to pull tracks, so an id alone proves nothing. Owners are kept in memory, the newest 32 sessions per user, so a user past that loses only their own oldest; after a restart a live session answers 404 and the client opens a new one. Only the path is checked: the remote sessions a `tracks/new` body pulls from are not, since bodies stay opaque.
+6. Body: SFU reads up to 256 KB, over is 413 `M_TOO_LARGE`; TURN ignores its body (the TTL is config).
+7. Upstream: SFU one attempt, bearer App Secret, client Content-Type relayed; TURN `{"ttl": turn_credential_ttl}`, bearer API token, two retries with backoff on connect failure, timeout, 5xx or 429.
+8. Relay: Cloudflare's status, Content-Type and body byte-for-byte. Unavailable is 502 `M_UNKNOWN` "calls service unavailable".
 
 Success responses carry no CORS headers, which Synapse adds only to its own error responses; the native app never preflights.
 
@@ -57,7 +58,7 @@ modules:
 
 ## Upstream client
 
-Own Twisted `Agent` over a persistent pool (8 per host, idle connections dropped after 60 s so a keep-alive Cloudflare has closed is never reused), connect timeout = `timeout`, system CA verification, redirects never followed, response body capped at 1 MB. Each attempt is bounded by `timeout` for the SFU and `turn_timeout` for TURN, so a mint's three attempts take at most 15 s. `api.http_client` is not used: fixed 60 s timeout, shared pool with Synapse's other outbound traffic. Per process; the limiter is too.
+Own Twisted `Agent` over a persistent pool (8 per host, idle connections dropped after 60 s so a keep-alive Cloudflare has closed is never reused), connect timeout = `timeout`, system CA verification, redirects never followed, response body capped at 1 MB. Each attempt is bounded by `timeout` for the SFU and `turn_timeout` for TURN, so a mint's three attempts take at most 15 s. `api.http_client` is not used: fixed 60 s timeout, shared pool with Synapse's other outbound traffic. Per process; the limiter and the session owners are too.
 
 ## Metrics
 

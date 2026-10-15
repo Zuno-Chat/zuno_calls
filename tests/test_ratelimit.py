@@ -50,9 +50,10 @@ def test_idle_keys_are_purged_when_the_map_doubles():
     assert limiter.allow("fresh") == 1000
 
 
-def test_non_positive_rate_is_rejected():
+@pytest.mark.parametrize("rate", [0, float("nan"), float("inf")])
+def test_non_positive_or_non_finite_rate_is_rejected(rate):
     with pytest.raises(ValueError):
-        RateLimiter(per_second=0, burst=1)
+        RateLimiter(per_second=rate, burst=1)
 
 
 def test_burst_below_one_is_rejected():
