@@ -63,5 +63,7 @@ jobs:
           # the variant matching the target.
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/zuno-chat/zuno-calls-wheel:${{ github.ref_name }}
+          tags: |
+            ghcr.io/zuno-chat/zuno-calls-wheel:${{ github.ref_name }}
+            ghcr.io/zuno-chat/zuno-calls-wheel:latest
           provenance: false

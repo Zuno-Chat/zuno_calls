@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zuno-calls"
-version = "0.1.0"
+version = "0.1.1"
 description = "Synapse module: Cloudflare Calls signaling proxy and TURN credentials for Zuno Chat"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
