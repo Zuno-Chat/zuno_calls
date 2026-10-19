@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from synapse.module_api import DirectServeJsonResource, ModuleApi
@@ -37,6 +37,7 @@ class Call:
     body: bytes
     user_id: str
     device_id: str | None
+    query: Mapping[str, str] = field(default_factory=dict)  # first value per key; never relayed
 
 
 @dataclass(frozen=True)
@@ -143,7 +144,11 @@ class ZunoResource(DirectServeJsonResource):
         content_type = request.getHeader("Content-Type")
         if content_type is not None and not _HEADER_VALUE.fullmatch(content_type):
             content_type = None
-        call = Call(method, segments, content_type, body, user_id, device_id)
+        query = {
+            k.decode("utf-8", "replace"): v[0].decode("utf-8", "replace")
+            for k, v in request.args.items()
+        }
+        call = Call(method, segments, content_type, body, user_id, device_id, query)
         try:
             reply = await self._handler(call)
         except UpstreamUnavailable:

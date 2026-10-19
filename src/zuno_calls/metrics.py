@@ -5,6 +5,7 @@ from prometheus_client import Counter, Histogram
 RATE_LIMITED = Counter(
     "zuno_calls_rate_limited_total", "Requests refused by the per-device limiter"
 )
+CALL_FULL = Counter("zuno_calls_call_full_total", "Session opens refused because the call is full")
 UPSTREAM_REQUESTS = Counter(
     "zuno_calls_upstream_requests_total", "Cloudflare responses by status", ["api", "code"]
 )

@@ -29,6 +29,7 @@ def test_registers_both_resources():
     assert turn_res._routes == turn.ROUTES
     assert turn_res._read_body is False
     assert sfu_res._limiter is turn_res._limiter
+    assert isinstance(sfu_res._handler, sfu.SFUHandler) and sfu_res._handler._max == 6
 
 
 def test_without_cloudflare_section_nothing_is_registered():

@@ -29,12 +29,27 @@ ALICE_2 = FakeRequester(FakeUser("@alice:zuno.chat"), "DEV2")
 APPSERVICE = FakeRequester(FakeUser("@bot:zuno.chat"), None)
 
 
+@dataclass
+class FakeEvent:
+    content: dict
+
+
 class FakeModuleApi:
-    """The two ModuleApi calls the module makes, backed by a token table."""
+    """The ModuleApi calls the module makes, backed by a token table and room state."""
 
     def __init__(self) -> None:
         self.tokens = {"tok-alice": ALICE, "tok-alice-2": ALICE_2, "tok-bot": APPSERVICE}
         self.registered: list[tuple[str, object]] = []
+        self.rooms: dict[str, dict[tuple[str, str], FakeEvent]] = {}
+
+    async def get_room_state(self, room_id, event_filter=None):
+        state = self.rooms.get(room_id, {})
+        wanted = list(event_filter or [])
+        return {
+            key: event
+            for key, event in state.items()
+            if not wanted or any(key[0] == t and sk in (None, key[1]) for t, sk in wanted)
+        }
 
     def register_web_resource(self, path: str, resource: object) -> None:
         self.registered.append((path, resource))
@@ -59,9 +74,11 @@ class FakeRequest:
         postpath: list[str],
         body: bytes = b"",
         headers: dict[str, str] | None = None,
+        args: dict[str, list[str]] | None = None,
     ) -> None:
         self.method = method.encode()
         self.postpath = [p.encode() for p in postpath]
+        self.args = {k.encode(): [v.encode() for v in vs] for k, vs in (args or {}).items()}
         self.content = BytesIO(body)
         self._headers = {k.lower(): v for k, v in (headers or {}).items()}
         self.code = 200
@@ -94,11 +111,12 @@ def authed(
     body: bytes = b"",
     token: str = "tok-alice",
     content_type: str | None = "application/json",
+    args: dict[str, list[str]] | None = None,
 ) -> FakeRequest:
     headers = {"Authorization": f"Bearer {token}"}
     if content_type:
         headers["Content-Type"] = content_type
-    return FakeRequest(method, postpath, body, headers)
+    return FakeRequest(method, postpath, body, headers, args)
 
 
 DEFAULT_REPLY = UpstreamResponse(200, "application/json", b"{}")
@@ -106,10 +124,11 @@ DEFAULT_REPLY = UpstreamResponse(200, "application/json", b"{}")
 
 @dataclass
 class FakeUpstream:
-    """Records what a handler sent and answers from `replies`, DEFAULT_REPLY once they run out."""
+    """Records what a handler sent and answers from `replies` (an exception is raised),
+    DEFAULT_REPLY once they run out."""
 
     calls: list[dict] = field(default_factory=list)
-    replies: list[UpstreamResponse] = field(default_factory=list)
+    replies: list[UpstreamResponse | Exception] = field(default_factory=list)
 
     def reply(
         self, status: int = 200, content_type: str | None = "application/json", body: bytes = b"{}"
@@ -138,7 +157,10 @@ class FakeUpstream:
                 "timeout": timeout,
             }
         )
-        return self.replies.pop(0) if self.replies else DEFAULT_REPLY
+        reply = self.replies.pop(0) if self.replies else DEFAULT_REPLY
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
 
 
 def as_api(fake: FakeModuleApi) -> ModuleApi:

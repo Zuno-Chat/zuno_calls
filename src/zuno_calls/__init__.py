@@ -44,7 +44,10 @@ class ZunoCalls:
         api.register_web_resource(
             SFU_PATH,
             SFUResource(
-                api, limiter, sfu.SFUHandler(config.cloudflare, upstream), routes=sfu.ROUTES
+                api,
+                limiter,
+                sfu.SFUHandler(config.cloudflare, upstream, api, config.max_call_participants),
+                routes=sfu.ROUTES,
             ),
         )
         api.register_web_resource(

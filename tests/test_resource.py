@@ -96,6 +96,15 @@ async def test_happy_path_builds_call_and_relays_reply():
 
 
 @pytest_twisted.ensureDeferred
+async def test_query_reaches_the_handler_first_value_per_key():
+    res, handler = resource()
+    await res._async_render(
+        authed("POST", ["new"], args={"room_id": ["!r:zuno.chat", "!s:zuno.chat"], "call_id": [""]})
+    )
+    assert handler.calls[0].query == {"room_id": "!r:zuno.chat", "call_id": ""}
+
+
+@pytest_twisted.ensureDeferred
 async def test_a_204_carries_no_content_type_length_or_body():
     res, _ = resource(Recorder(Reply(204, None, b"")))
     req = authed("POST", ["new"])

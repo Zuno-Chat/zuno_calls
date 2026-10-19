@@ -28,6 +28,7 @@ def test_minimal_inline_config_and_defaults():
     assert cf.timeout == 10.0
     assert cf.turn_timeout == 5.0
     assert (cfg.rate_limit.per_second, cfg.rate_limit.burst) == (5.0, 10)
+    assert cfg.max_call_participants == 6
 
 
 def test_no_cloudflare_section_registers_nothing():
@@ -100,6 +101,7 @@ def test_overrides_are_parsed():
                 "turn_timeout": "2500ms",
             },
             "rate_limit": {"per_second": 0.5, "burst": 2},
+            "max_call_participants": 8,
         }
     )
     assert cfg.cloudflare is not None
@@ -108,6 +110,16 @@ def test_overrides_are_parsed():
     assert cfg.cloudflare.timeout == 3.0
     assert cfg.cloudflare.turn_timeout == 2.5
     assert (cfg.rate_limit.per_second, cfg.rate_limit.burst) == (0.5, 2)
+    assert cfg.max_call_participants == 8
+
+
+@pytest.mark.parametrize("bad", [0, -1, "6", True, 6.0, None])
+def test_max_call_participants_is_refused_with_every_other_problem(bad):
+    with pytest.raises(ConfigError) as exc:
+        parse_config({**FULL, "max_call_participants": bad, "rate_limit": {"burst": 0}})
+    message = str(exc.value)
+    assert "max_call_participants must be an integer of at least 1" in message
+    assert "burst" in message
 
 
 @pytest.mark.parametrize(

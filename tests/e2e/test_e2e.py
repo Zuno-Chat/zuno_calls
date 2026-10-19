@@ -1,7 +1,7 @@
 """The module inside a real Synapse. Needs Docker; run with `make e2e`.
 
 Runs synapse:v1.161.0 with the module installed on the host network (SQLite)
-against a stub Cloudflare, registers a user through the shared-secret admin
+against a stub Cloudflare, registers users through the shared-secret admin
 endpoint and exercises the routes through Synapse's own auth. Both ports are
 overridable so two runs can share a machine.
 """
@@ -21,6 +21,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -59,6 +60,7 @@ form_secret: e2e-form
 modules:
   - module: zuno_calls.ZunoCalls
     config:
+      max_call_participants: 1
       cloudflare:
         app_id: APP
         app_secret: SECRET
@@ -121,16 +123,16 @@ def http(method: str, url: str, body=None, token: str | None = None):
         return e.code, json.loads(e.read() or b"null")
 
 
-def register_user() -> str:
+def register_user(name: str = "alice") -> str:
     _, nonce = http("GET", f"{SYNAPSE}/_synapse/admin/v1/register")
     mac = hmac.new(SHARED_SECRET.encode(), digestmod=hashlib.sha1)
-    mac.update(b"\x00".join([nonce["nonce"].encode(), b"alice", b"wonderland", b"notadmin"]))
+    mac.update(b"\x00".join([nonce["nonce"].encode(), name.encode(), b"wonderland", b"notadmin"]))
     status, body = http(
         "POST",
         f"{SYNAPSE}/_synapse/admin/v1/register",
         {
             "nonce": nonce["nonce"],
-            "username": "alice",
+            "username": name,
             "password": "wonderland",
             "admin": False,
             "mac": mac.hexdigest(),
@@ -225,6 +227,32 @@ def test_turn_round_trip(token):
             "body": json.dumps({"ttl": 7200}).encode(),
         }
     ]
+
+
+def test_a_full_call_is_refused(token):
+    bob = register_user("bob")
+    status, created = http(
+        "POST",
+        f"{SYNAPSE}/_matrix/client/v3/createRoom",
+        {"preset": "public_chat", "power_level_content_override": {"events": {"m.call.member": 0}}},
+        token=token,
+    )
+    assert status == 200, created
+    room_id = created["room_id"]
+    room = f"{SYNAPSE}/_matrix/client/v3/rooms/{quote(room_id, safe='')}"
+    assert http("POST", f"{room}/join", {}, token=bob)[0] == 200
+    live = {"call_id": "c1", "device_id": "D", "expires_ts": int(time.time() * 1000) + 3_600_000}
+    status, _ = http(
+        "PUT", f"{room}/state/m.call.member/{quote('@bob:e2e')}", {"memberships": [live]}, token=bob
+    )
+    assert status == 200
+    Stub.seen.clear()
+    url = f"{SFU}/new?room_id={quote(room_id, safe='')}&call_id=c1"
+    assert http("POST", url, {}, token=token) == (
+        403,
+        {"errcode": "IM.ZUNO.CALL_FULL", "error": "This call is full", "max_participants": 1},
+    )
+    assert Stub.seen == []
 
 
 # burst 3 against 6 attempts: the margin holds whether or not earlier tests spent tokens.

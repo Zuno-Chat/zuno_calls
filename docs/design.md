@@ -6,13 +6,15 @@ Synapse module serving the calling backend. Synapse checks the Matrix access tok
 
 | Route | Upstream |
 |---|---|
-| `POST /_synapse/client/zuno/calls/cloudflare/sessions/new` | `{base_url}/v1/apps/{app_id}/sessions/new` |
+| `POST /_synapse/client/zuno/calls/cloudflare/sessions/new?room_id=…&call_id=…` | `{base_url}/v1/apps/{app_id}/sessions/new` |
 | `GET  .../sessions/{sessionId}` | same suffix |
 | `POST .../sessions/{sessionId}/tracks/new` | same suffix |
 | `PUT  .../sessions/{sessionId}/renegotiate` | same suffix |
 | `PUT  .../sessions/{sessionId}/tracks/close` | same suffix |
 | `PUT  .../sessions/{sessionId}/tracks/update` | same suffix |
 | `POST /_synapse/client/zuno/calls/cloudflare/turn/credentials` | `{base_url}/v1/turn/keys/{turn_key_id}/credentials/generate-ice-servers` |
+
+`sessions/new` names the call the session is for; the query is the module's and never reaches Cloudflare.
 
 The backend is named in the path so a LiveKit backend lands beside it (`.../calls/livekit/sfu/get`) and both run during a rollover. LiveKit needs none of the SFU routes: its client SDK does its own signaling and its server hands out ICE servers, so the seam is the app's `CallEngine`.
 
@@ -23,9 +25,10 @@ The backend is named in the path so a LiveKit backend lands beside it (`.../call
 3. Rate limit: token bucket per key; over is 429 `M_LIMIT_EXCEEDED` with `retry_after_ms`, Cloudflare never called.
 4. SFU path check: every segment `[A-Za-z0-9_-]{1,128}`, else 400 `M_INVALID_PARAM` — every other bad segment.
 5. SFU session owner: a `{sessionId}` must be one this user opened through `sessions/new` on this process, else 404 `M_NOT_FOUND`, the same as a session that never existed. Call participants learn each other's ids to pull tracks, so an id alone proves nothing. Owners are kept in memory, the newest 32 sessions per user, so a user past that loses only their own oldest; after a restart a live session answers 404 and the client opens a new one. Only the path is checked: the remote sessions a `tracks/new` body pulls from are not, since bodies stay opaque.
-6. Body: SFU reads up to 256 KB, over is 413 `M_TOO_LARGE`; TURN ignores its body (the TTL is config).
-7. Upstream: SFU one attempt, bearer App Secret, client Content-Type relayed; TURN `{"ttl": turn_credential_ttl}`, bearer API token, two retries with backoff on connect failure, timeout, 5xx or 429.
-8. Relay: Cloudflare's status, Content-Type and body byte-for-byte. Unavailable is 502 `M_UNKNOWN` "calls service unavailable".
+6. Call cap, `sessions/new` only: `room_id` must start with `!`, `call_id` be non-empty, both at most 255 characters, else 400 `M_INVALID_PARAM`. The caller must be joined to the room, else 403 `M_FORBIDDEN`. Participants are distinct users other than the caller with a live `m.call.member` membership for `call_id` (`expires_ts` later than now) or a reservation; at `max_call_participants` the open is 403 `IM.ZUNO.CALL_FULL` with `max_participants`, Cloudflare never called. Otherwise the caller holds a reservation for 60 s, enough to publish tracks and its own `m.call.member`; a failed open releases it. Counting and reserving happen with no await between them, so two opens racing for the last place cannot both pass. The caller never counts against themselves, so a rejoin always passes. Temporary: an open naming neither `room_id` nor `call_id` (app releases up to v1.3.0) skips this step; once the oldest supported release names the call, a missing one becomes 400 `M_MISSING_PARAM`.
+7. Body: SFU reads up to 256 KB, over is 413 `M_TOO_LARGE`; TURN ignores its body (the TTL is config).
+8. Upstream: SFU one attempt, bearer App Secret, client Content-Type relayed; TURN `{"ttl": turn_credential_ttl}`, bearer API token, two retries with backoff on connect failure, timeout, 5xx or 429.
+9. Relay: Cloudflare's status, Content-Type and body byte-for-byte. Unavailable is 502 `M_UNKNOWN` "calls service unavailable".
 
 Success responses carry no CORS headers, which Synapse adds only to its own error responses; the native app never preflights.
 
@@ -37,6 +40,7 @@ Handlers are `async (Call) -> Reply`; `ZunoResource` is the glue (route, auth, l
 modules:
   - module: zuno_calls.ZunoCalls
     config:
+      max_call_participants: 6                                # default; any backend
       cloudflare:
         app_id: "..."
         app_secret_path: /data/secrets/cf_calls_app_secret    # or app_secret
@@ -58,12 +62,12 @@ modules:
 
 ## Upstream client
 
-Own Twisted `Agent` over a persistent pool (8 per host, idle connections dropped after 60 s so a keep-alive Cloudflare has closed is never reused), connect timeout = `timeout`, system CA verification, redirects never followed, response body capped at 1 MB. Each attempt is bounded by `timeout` for the SFU and `turn_timeout` for TURN, so a mint's three attempts take at most 15 s. `api.http_client` is not used: fixed 60 s timeout, shared pool with Synapse's other outbound traffic. Per process; the limiter and the session owners are too.
+Own Twisted `Agent` over a persistent pool (8 per host, idle connections dropped after 60 s so a keep-alive Cloudflare has closed is never reused), connect timeout = `timeout`, system CA verification, redirects never followed, response body capped at 1 MB. Each attempt is bounded by `timeout` for the SFU and `turn_timeout` for TURN, so a mint's three attempts take at most 15 s. `api.http_client` is not used: fixed 60 s timeout, shared pool with Synapse's other outbound traffic. Per process; the limiter, the session owners and the call reservations are too.
 
 ## Metrics
 
-`zuno_calls_rate_limited_total`, `zuno_calls_upstream_requests_total{api,code}`, `zuno_calls_upstream_seconds{api}`, `zuno_calls_upstream_retries_total{api}`, `zuno_calls_upstream_errors_total{api,reason}` with `reason` in `timeout|connect|too_large|other`. Per-backend counts and latency come from Synapse's `synapse_http_server_*`, labelled by resource class name: `SFUResource` and `TurnResource`.
+`zuno_calls_rate_limited_total`, `zuno_calls_call_full_total`, `zuno_calls_upstream_requests_total{api,code}`, `zuno_calls_upstream_seconds{api}`, `zuno_calls_upstream_retries_total{api}`, `zuno_calls_upstream_errors_total{api,reason}` with `reason` in `timeout|connect|too_large|other`. Per-backend counts and latency come from Synapse's `synapse_http_server_*`, labelled by resource class name: `SFUResource` and `TurnResource`.
 
 ## Tests
 
-`make test`: unit tests with a fake ModuleApi and fake upstream, plus a real local Twisted server for the upstream client. `make e2e` (Docker, opt-in): the module inside `synapse:v1.161.0` against a stub Cloudflare; proves loading, `parse_config`, path registration and Synapse's auth together.
+`make test`: unit tests with a fake ModuleApi and fake upstream, plus a real local Twisted server for the upstream client. `make e2e` (Docker, opt-in): the module inside `synapse:v1.161.0` against a stub Cloudflare; proves loading, `parse_config`, path registration, Synapse's auth and the call cap's `get_room_state` together.

@@ -54,6 +54,7 @@ class RateLimitConfig:
 class Config:
     cloudflare: CloudflareConfig | None
     rate_limit: RateLimitConfig
+    max_call_participants: int = 6
 
 
 def parse_duration(value: object) -> float:
@@ -76,12 +77,16 @@ def parse_config(raw: object) -> Config:
         raw = {}
     if not isinstance(raw, dict):
         raise ConfigError("zuno_calls: config must be a map")
-    errors = [f"unknown key {key!r}" for key in sorted(set(raw) - {"cloudflare", "rate_limit"})]
+    known = {"cloudflare", "rate_limit", "max_call_participants"}
+    errors = [f"unknown key {key!r}" for key in sorted(set(raw) - known)]
     cloudflare = _parse_cloudflare(raw["cloudflare"], errors) if "cloudflare" in raw else None
     rate_limit = _parse_rate_limit(raw.get("rate_limit"), errors)
+    cap = raw.get("max_call_participants", Config.max_call_participants)
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+        errors.append("max_call_participants must be an integer of at least 1")
     if errors:
         raise ConfigError("zuno_calls: " + "; ".join(errors))
-    return Config(cloudflare=cloudflare, rate_limit=rate_limit)
+    return Config(cloudflare=cloudflare, rate_limit=rate_limit, max_call_participants=cap)
 
 
 def _parse_cloudflare(section: Any, errors: list[str]) -> CloudflareConfig | None:
