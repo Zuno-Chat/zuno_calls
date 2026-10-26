@@ -6,6 +6,7 @@ Matrix JSON and runs the handler under Synapse's logging-context rules.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -27,6 +28,7 @@ SESSION_ID = "{sessionId}"
 _HEADER_VALUE = re.compile(r"[\x21-\x7e][\x20-\x7e]*")
 
 Route = tuple[str, tuple[str, ...]]
+Place = tuple[str, str]  # (room_id, call_id): one call, whichever backend carries it
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,22 @@ class Reply:
 
 
 Handler = Callable[[Call], Awaitable[Reply]]
+
+
+def parse_place(query: Mapping[str, str]) -> Place:
+    room_id = query.get("room_id", "")
+    call_id = query.get("call_id", "")
+    if not (room_id.startswith("!") and len(room_id) <= 255 and 0 < len(call_id) <= 255):
+        raise SynapseError(400, "Invalid room_id or call_id", Codes.INVALID_PARAM)
+    return room_id, call_id
+
+
+def json_object(body: bytes) -> dict[str, Any] | None:
+    try:
+        content = json.loads(body)
+    except ValueError:
+        return None
+    return content if isinstance(content, dict) else None
 
 
 def reserved_words(routes: Sequence[Route]) -> frozenset[str]:

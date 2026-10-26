@@ -36,6 +36,7 @@ CONTAINER = f"zuno-calls-e2e-{SYNAPSE_PORT}"
 SYNAPSE = f"http://127.0.0.1:{SYNAPSE_PORT}"
 SFU = f"{SYNAPSE}/_synapse/client/zuno/calls/cloudflare/sessions"
 TURN = f"{SYNAPSE}/_synapse/client/zuno/calls/cloudflare/turn/credentials"
+REMOVE = f"{SYNAPSE}/_synapse/client/zuno/calls/remove"
 SHARED_SECRET = "e2e-registration-secret"
 
 HOMESERVER = f"""\
@@ -251,6 +252,39 @@ def test_a_full_call_is_refused(token):
     assert http("POST", url, {}, token=token) == (
         403,
         {"errcode": "IM.ZUNO.CALL_FULL", "error": "This call is full", "max_participants": 1},
+    )
+    assert Stub.seen == []
+
+
+def test_a_removed_member_cannot_rejoin(token):
+    # Fresh users: their rate buckets are full whatever the earlier tests spent.
+    carol, dave = register_user("carol"), register_user("dave")
+    status, created = http(
+        "POST",
+        f"{SYNAPSE}/_matrix/client/v3/createRoom",
+        {"preset": "public_chat", "power_level_content_override": {"events": {"m.call.member": 0}}},
+        token=carol,
+    )
+    assert status == 200, created
+    room_id = created["room_id"]
+    room = f"{SYNAPSE}/_matrix/client/v3/rooms/{quote(room_id, safe='')}"
+    assert http("POST", f"{room}/join", {}, token=dave)[0] == 200
+    live = {"call_id": "c2", "device_id": "D", "expires_ts": int(time.time() * 1000) + 3_600_000}
+    status, _ = http(
+        "PUT",
+        f"{room}/state/m.call.member/{quote('@dave:e2e')}",
+        {"memberships": [live]},
+        token=dave,
+    )
+    assert status == 200
+    query = f"?room_id={quote(room_id, safe='')}&call_id=c2"
+    status, body = http("POST", REMOVE + query, {"user_id": "@carol:e2e"}, token=dave)
+    assert (status, body["errcode"]) == (403, "M_FORBIDDEN")
+    assert http("POST", REMOVE + query, {"user_id": "@dave:e2e"}, token=carol) == (200, {})
+    Stub.seen.clear()
+    assert http("POST", f"{SFU}/new{query}", {}, token=dave) == (
+        403,
+        {"errcode": "IM.ZUNO.CALL_REMOVED", "error": "Removed from this call"},
     )
     assert Stub.seen == []
 

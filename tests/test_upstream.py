@@ -6,7 +6,7 @@ from typing import Any, cast
 
 import pytest
 import pytest_twisted
-from prometheus_client import REGISTRY
+from conftest import sample
 from twisted.internet import reactor as _reactor
 from twisted.internet.protocol import Factory, Protocol
 from twisted.internet.task import deferLater
@@ -16,11 +16,6 @@ from twisted.web.server import NOT_DONE_YET, Site
 from zuno_calls.upstream import RetryPolicy, Upstream, UpstreamUnavailable
 
 reactor: Any = _reactor  # the reactor module has no usable static type
-
-
-def sample(name, **labels):
-    """A metric's current value, 0 before it is first observed."""
-    return REGISTRY.get_sample_value(name, labels) or 0.0
 
 
 class Echo(Resource):

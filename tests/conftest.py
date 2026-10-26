@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import cast
 
+import pytest
+from prometheus_client import REGISTRY
 from synapse.module_api import ModuleApi
 from synapse.module_api.errors import Codes, SynapseError
 
@@ -32,15 +35,27 @@ APPSERVICE = FakeRequester(FakeUser("@bot:zuno.chat"), None)
 @dataclass
 class FakeEvent:
     content: dict
+    sender: str = ""
 
 
 class FakeModuleApi:
-    """The ModuleApi calls the module makes, backed by a token table and room state."""
+    """The ModuleApi calls the module makes, backed by a token table, room state and SQLite."""
 
     def __init__(self) -> None:
         self.tokens = {"tok-alice": ALICE, "tok-alice-2": ALICE_2, "tok-bot": APPSERVICE}
         self.registered: list[tuple[str, object]] = []
         self.rooms: dict[str, dict[tuple[str, str], FakeEvent]] = {}
+        self.db = sqlite3.connect(":memory:")
+
+    async def run_db_interaction(self, desc, func, *args):
+        cursor = self.db.cursor()
+        try:
+            result = func(cursor, *args)
+        except BaseException:
+            self.db.rollback()
+            raise
+        self.db.commit()
+        return result
 
     async def get_room_state(self, room_id, event_filter=None):
         state = self.rooms.get(room_id, {})
@@ -161,6 +176,17 @@ class FakeUpstream:
         if isinstance(reply, Exception):
             raise reply
         return reply
+
+
+def sample(name, **labels):
+    """A metric's current value, 0 before it is first observed."""
+    return REGISTRY.get_sample_value(name, labels) or 0.0
+
+
+async def expect_error(handler, call, code, errcode):
+    with pytest.raises(SynapseError) as exc:
+        await handler(call)
+    assert (exc.value.code, exc.value.errcode) == (code, errcode)
 
 
 def as_api(fake: FakeModuleApi) -> ModuleApi:

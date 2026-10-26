@@ -1,4 +1,4 @@
-"""Synapse module: Cloudflare Calls signaling proxy and TURN credentials for Zuno Chat.
+"""Synapse module: Cloudflare Calls signaling proxy, TURN credentials and call removal.
 
 homeserver.yaml:
 
@@ -13,16 +13,18 @@ from typing import Any
 
 from synapse.module_api import ModuleApi
 
+from . import removal
 from .backends.cloudflare import sfu, turn
 from .config import Config, parse_config
 from .ratelimit import RateLimiter
 from .resource import ZunoResource
 from .upstream import Upstream
 
-# Two leaves at disjoint prefixes: a leaf swallows every path below it, so
-# the TURN resource can never sit under the SFU one.
+# Leaves at disjoint prefixes: a leaf swallows every path below it, so none
+# can sit under another. Removal is backend-neutral, so outside cloudflare/.
 SFU_PATH = "/_synapse/client/zuno/calls/cloudflare/sessions"
 TURN_PATH = "/_synapse/client/zuno/calls/cloudflare/turn/credentials"
+REMOVE_PATH = "/_synapse/client/zuno/calls/remove"
 
 
 # Synapse labels its per-request series (synapse_http_server_*) by resource
@@ -35,20 +37,22 @@ class TurnResource(ZunoResource):
     pass
 
 
+class RemoveResource(ZunoResource):
+    pass
+
+
 class ZunoCalls:
     def __init__(self, config: Config, api: ModuleApi) -> None:
         if config.cloudflare is None:
             return
         limiter = RateLimiter(config.rate_limit.per_second, config.rate_limit.burst)
         upstream = Upstream(config.cloudflare.timeout)
+        removals = removal.Removals(api)
+        sfu_handler = sfu.SFUHandler(
+            config.cloudflare, upstream, api, config.max_call_participants, removals
+        )
         api.register_web_resource(
-            SFU_PATH,
-            SFUResource(
-                api,
-                limiter,
-                sfu.SFUHandler(config.cloudflare, upstream, api, config.max_call_participants),
-                routes=sfu.ROUTES,
-            ),
+            SFU_PATH, SFUResource(api, limiter, sfu_handler, routes=sfu.ROUTES)
         )
         api.register_web_resource(
             TURN_PATH,
@@ -58,6 +62,15 @@ class ZunoCalls:
                 turn.TurnHandler(config.cloudflare, upstream),
                 routes=turn.ROUTES,
                 read_body=False,
+            ),
+        )
+        api.register_web_resource(
+            REMOVE_PATH,
+            RemoveResource(
+                api,
+                limiter,
+                removal.RemoveHandler(api, removals, [sfu_handler.cut_off]),
+                routes=removal.ROUTES,
             ),
         )
 
