@@ -21,7 +21,7 @@ dev = [
   # Track the deployed image; move together with tests/e2e/Dockerfile and the
   # docker repo's synapse/Dockerfile FROM.
   "matrix-synapse==1.161.0",
-  "Twisted==25.5.0",
+  "Twisted==26.4.0rc2",
   "pytest>=8",
   "pytest-twisted>=1.14",
   "pytest-cov>=5",
