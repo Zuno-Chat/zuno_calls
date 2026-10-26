@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import weakref
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import cast
@@ -46,6 +47,7 @@ class FakeModuleApi:
         self.registered: list[tuple[str, object]] = []
         self.rooms: dict[str, dict[tuple[str, str], FakeEvent]] = {}
         self.db = sqlite3.connect(":memory:")
+        weakref.finalize(self, self.db.close)  # Python 3.13 warns on an unclosed connection
 
     async def run_db_interaction(self, desc, func, *args):
         cursor = self.db.cursor()
