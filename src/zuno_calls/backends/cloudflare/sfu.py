@@ -1,11 +1,12 @@
-"""Cloudflare Calls (Realtime SFU) session and track routes, relayed to Cloudflare.
+"""Cloudflare Calls (Realtime SFU) session, track and data channel routes, relayed to Cloudflare.
 
 Only these (method, path) pairs are reachable, and only on a session the caller
 opened; opening one in a named call is refused once that call is full or the
 caller was removed from it. A session opened in a call is bound to it. Bodies
-are relayed as sent, except that track bodies are parsed for the sessions they
-pull from, which must be in the puller's call and not belong to someone removed
-from it. No retry: SDP and track state changes are not blindly retry-safe.
+are relayed as sent, except that track and data channel bodies are parsed for
+the sessions they pull from, which must be in the puller's call and not belong
+to someone removed from it. No retry: SDP and track state changes are not
+blindly retry-safe.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import re
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from synapse.module_api import ModuleApi, make_deferred_yieldable
@@ -34,13 +36,48 @@ ROUTES: tuple[Route, ...] = (
     ("PUT", (SESSION_ID, "renegotiate")),
     ("PUT", (SESSION_ID, "tracks", "close")),
     ("PUT", (SESSION_ID, "tracks", "update")),
+    ("POST", (SESSION_ID, "datachannels", "establish")),
+    ("POST", (SESSION_ID, "datachannels", "new")),
+    ("PUT", (SESSION_ID, "datachannels", "close")),
 )
 
-# Both name remote sessions to pull from; tracks/update can point an existing
+
+@dataclass(frozen=True)
+class _Resource:
+    entries: str
+    id_key: str
+    metric_scope: str
+    close_route: str
+    close_flags: Mapping[str, Any]
+    already_closed: tuple[str, ...]
+
+
+_TRACKS = _Resource(
+    entries="tracks",
+    id_key="mid",
+    metric_scope="track",
+    close_route="tracks/close",
+    close_flags={"force": True},
+    # close_track_error is Cloudflare's "absent or already closed".
+    already_closed=("close_track_error",),
+)
+_DATA_CHANNELS = _Resource(
+    entries="dataChannels",
+    id_key="id",
+    metric_scope="channel",
+    close_route="datachannels/close",
+    close_flags={},
+    already_closed=(),
+)
+# Each names remote sessions to pull from; tracks/update can point an existing
 # transceiver at another session's track.
-_PULLS = (("tracks", "new"), ("tracks", "update"))
+_PULLS: dict[tuple[str, ...], _Resource] = {
+    ("tracks", "new"): _TRACKS,
+    ("tracks", "update"): _TRACKS,
+    ("datachannels", "new"): _DATA_CHANNELS,
+}
 NOT_IN_CALL = "IM.ZUNO.TRACK_NOT_IN_CALL"
-_DESCRIPTIONS = {CALL_REMOVED: CALL_REMOVED_DESCRIPTION, NOT_IN_CALL: "Track is not in this call"}
+_DESCRIPTIONS = {CALL_REMOVED: CALL_REMOVED_DESCRIPTION, NOT_IN_CALL: "Not in this call"}
 
 # Cloudflare session ids are 32 hex characters; anything else that reaches the
 # upstream path could reshape an allowlisted route.
@@ -128,19 +165,28 @@ def _answer(response: UpstreamResponse) -> dict[str, Any] | None:
     return None if content is None or "errorCode" in content else content
 
 
-def _refused(track: Mapping[str, Any], errcode: str) -> dict[str, Any]:
-    """A pulled track's refusal in Cloudflare's own per-track error shape."""
-    named = {k: track[k] for k in ("location", "sessionId", "trackName") if k in track}
+def _resource_id(value: object) -> bool:
+    return (isinstance(value, str) and value != "") or (
+        isinstance(value, int) and not isinstance(value, bool)
+    )
+
+
+def _refused(entry: Mapping[str, Any], errcode: str) -> dict[str, Any]:
+    """A pulled entry's refusal in Cloudflare's own per-entry error shape."""
+    names = ("location", "sessionId", "trackName", "dataChannelName")
+    named = {k: entry[k] for k in names if k in entry}
     return {**named, "errorCode": errcode, "errorDescription": _DESCRIPTIONS[errcode]}
 
 
-def _with_refusals(response: UpstreamResponse, refused: list[tuple[int, dict[str, Any]]]) -> Reply:
-    """Cloudflare's answer with the refused tracks back at their places in tracks[]."""
+def _with_refusals(
+    response: UpstreamResponse, pull: _Resource, refused: list[tuple[int, dict[str, Any]]]
+) -> Reply:
+    """Cloudflare's answer with the refused entries back at their places in its list."""
     content = _answer(response)
-    if content is None or not isinstance(content.get("tracks"), list):
+    if content is None or not isinstance(content.get(pull.entries), list):
         return Reply.relay(response)
-    for index, track in refused:
-        content["tracks"].insert(index, track)
+    for index, entry in refused:
+        content[pull.entries].insert(index, entry)
     return Reply(response.status, response.content_type, _dumps(content))
 
 
@@ -192,13 +238,11 @@ class SFUHandler:
             raise refusal(route)
         body = call.body
         refused: list[tuple[int, dict[str, Any]]] = []
-        if call.segments[1:] in _PULLS:
-            content, refused = self._screen(call, place, route)
-            if refused and not content["tracks"]:
-                answer = {
-                    "requiresImmediateRenegotiation": False,
-                    "tracks": [t for _, t in refused],
-                }
+        pull = _PULLS.get(call.segments[1:])
+        if pull is not None:
+            content, refused = self._screen(call, place, route, pull)
+            if refused and not content[pull.entries]:
+                answer = {pull.entries: [e for _, e in refused]}
                 return Reply(200, "application/json", _dumps(answer))
             # Relayed as parsed, so Cloudflare pulls exactly what was checked.
             body = _dumps(content)
@@ -212,7 +256,9 @@ class SFUHandler:
             self._busy[session_id].discard(request)
             if not self._busy[session_id]:
                 del self._busy[session_id]
-        return _with_refusals(response, refused) if refused else Reply.relay(response)
+        if pull is None or not refused:
+            return Reply.relay(response)
+        return _with_refusals(response, pull, refused)
 
     async def _relay(self, call: Call, body: bytes) -> UpstreamResponse:
         path = "/".join(call.segments)
@@ -259,7 +305,7 @@ class SFUHandler:
         return Reply.relay(response)
 
     async def _keep(self, session_id: str, user_id: str, place: Place | None) -> None:
-        """Remembers a new session; past the cap the user's oldest goes, its tracks closed first."""
+        """Remembers a new session; past the cap the user's oldest goes, closed first."""
         mine = self._sessions.setdefault(user_id, deque())
         forgotten: list[str] = []
         while len(mine) >= _SESSIONS_PER_USER:
@@ -282,40 +328,40 @@ class SFUHandler:
         self._opened[session_id] = (user_id, place)
 
     def _screen(
-        self, call: Call, place: Place | None, route: str
+        self, call: Call, place: Place | None, route: str, pull: _Resource
     ) -> tuple[dict[str, Any], list[tuple[int, dict[str, Any]]]]:
-        """The body without the tracks this caller may not pull, and their refusals by index."""
+        """The body without the entries this caller may not pull, and their refusals by index."""
         content = json_object(call.body)
         if content is None:
             raise SynapseError(400, "Content must be a JSON object", Codes.NOT_JSON)
-        tracks = content.get("tracks")
-        if not isinstance(tracks, list):
+        entries = content.get(pull.entries)
+        if not isinstance(entries, list):
             return content, []
         kept: list[Any] = []
         refused: list[tuple[int, dict[str, Any]]] = []
-        for index, track in enumerate(tracks):
-            errcode = self._pull_refusal(track, call.user_id, place, route)
+        for index, entry in enumerate(entries):
+            errcode = self._pull_refusal(entry, call.user_id, place, route)
             if errcode is None:
-                kept.append(track)
+                kept.append(entry)
                 continue
             if errcode == CALL_REMOVED:
-                REMOVED_REFUSALS.labels(route, "track").inc()
-            refused.append((index, _refused(track, errcode)))
-        return {**content, "tracks": kept}, refused
+                REMOVED_REFUSALS.labels(route, pull.metric_scope).inc()
+            refused.append((index, _refused(entry, errcode)))
+        return {**content, pull.entries: kept}, refused
 
     def _pull_refusal(
-        self, track: object, user_id: str, place: Place | None, route: str
+        self, entry: object, user_id: str, place: Place | None, route: str
     ) -> str | None:
-        """Why `user_id`, on a session in `place`, may not pull `track`; None when they may.
+        """Why `user_id`, on a session in `place`, may not pull `entry`; None when they may.
 
-        Raises when the puller was removed from the track's call: a pull no
+        Raises when the puller was removed from the entry's call: a pull no
         honest client makes, so the whole request goes.
         """
-        if not isinstance(track, dict) or (
-            track.get("location") == "local" and "sessionId" not in track
+        if not isinstance(entry, dict) or (
+            entry.get("location") == "local" and "sessionId" not in entry
         ):
             return None
-        remote = track.get("sessionId")
+        remote = entry.get("sessionId")
         opener, remote_place = (
             self._opened.get(remote, (None, None)) if isinstance(remote, str) else (None, None)
         )
@@ -332,10 +378,11 @@ class SFUHandler:
         return None
 
     async def cut_off(self, place: Place, user_id: str) -> None:
-        """Force-closes `user_id`'s tracks in `place`; answers once every one is closed.
+        """Force-closes `user_id`'s tracks and data channels in `place`; answers once every
+        one is closed.
 
-        On their sessions bound to the call that is every track; on their
-        unbound ones, the tracks pulled from sessions bound to it.
+        On their sessions bound to the call that is every one; on their unbound
+        ones, those pulled from sessions bound to it.
         """
         await self._load()
         calls = {s: self._opened[s][1] for s in self._sessions.get(user_id, ())}
@@ -351,53 +398,66 @@ class SFUHandler:
         """Waits out the requests in flight on these sessions now; later ones may run on.
 
         A later request on a session bound to the call is refused, so only the
-        ones already in flight could still add a track to close.
+        ones already in flight could still add a track or data channel to close.
         """
         waiting = {s: set(self._busy.get(s, ())) for s in session_ids}
         while any(requests & self._busy.get(s, set()) for s, requests in waiting.items()):
             await make_deferred_yieldable(deferLater(_reactor(), _DRAIN_SECONDS, lambda: None))
 
     async def _close(self, session_id: str, pulled_from: Place | None = None) -> None:
-        """Force-closes the session's open tracks, or with `pulled_from` only those it
-        pulls from sessions bound to that call; raises 503 unless every one closed."""
+        """Force-closes the session's open tracks and data channels, or with `pulled_from`
+        only those it pulls from sessions bound to that call; raises 503 unless every one
+        closed."""
         state = await self._request("GET", session_id)
         # A session Cloudflare no longer knows carries no media; 429 is not that.
         if 400 <= state.status < 500 and state.status != 429:
             return
         content = _answer(state)
-        tracks = None if content is None else content.get("tracks", [])
-        if not isinstance(tracks, list):
+        if content is None:
             raise _unfinished()
-        mids = [
-            t["mid"]
-            for t in tracks
-            if isinstance(t, dict)
-            and isinstance(t.get("mid"), str)
-            and t["mid"]
-            and t.get("status") != "inactive"
-            and (pulled_from is None or self._pulls_from(t, pulled_from))
+        for resource in (_TRACKS, _DATA_CHANNELS):
+            await self._close_open(session_id, content, resource, pulled_from)
+
+    async def _close_open(
+        self,
+        session_id: str,
+        state: Mapping[str, Any],
+        resource: _Resource,
+        pulled_from: Place | None,
+    ) -> None:
+        listed = state.get(resource.entries, [])
+        if not isinstance(listed, list):
+            raise _unfinished()
+        ids = [
+            e[resource.id_key]
+            for e in listed
+            if isinstance(e, dict)
+            and _resource_id(e.get(resource.id_key))
+            and e.get("status") != "inactive"
+            and (pulled_from is None or self._pulls_from(e, pulled_from))
         ]
-        if not mids:
+        if not ids:
             return
-        body = _dumps({"tracks": [{"mid": mid} for mid in mids], "force": True})
-        closed = await self._request("PUT", f"{session_id}/tracks/close", body, "application/json")
+        close = {resource.entries: [{resource.id_key: i} for i in ids], **resource.close_flags}
+        closed = await self._request(
+            "PUT", f"{session_id}/{resource.close_route}", _dumps(close), "application/json"
+        )
         content = _answer(closed)
-        results = None if content is None else content.get("tracks")
+        results = None if content is None else content.get(resource.entries)
         if not isinstance(results, list):
             raise _unfinished()
-        # close_track_error is Cloudflare's "absent or already closed".
         done = {
-            r.get("mid")
+            r.get(resource.id_key)
             for r in results
-            if isinstance(r, dict) and r.get("errorCode") in (None, "close_track_error")
+            if isinstance(r, dict) and r.get("errorCode") in (None, *resource.already_closed)
         }
-        if not done.issuperset(mids):
+        if not done.issuperset(ids):
             raise _unfinished()
 
-    def _pulls_from(self, track: Mapping[str, Any], place: Place) -> bool:
-        remote = track.get("sessionId")
+    def _pulls_from(self, entry: Mapping[str, Any], place: Place) -> bool:
+        remote = entry.get("sessionId")
         return (
-            track.get("location") == "remote"
+            entry.get("location") == "remote"
             and isinstance(remote, str)
             and self._opened.get(remote, ("", None))[1] == place
         )
@@ -471,7 +531,7 @@ class SFUHandler:
 
 def _unfinished() -> SynapseError:
     # The record stands and its refusals hold; the moderator's retry finishes the close.
-    return SynapseError(503, "Could not close the removed user's tracks yet", Codes.UNKNOWN)
+    return SynapseError(503, "Could not cut the removed user off yet", Codes.UNKNOWN)
 
 
 def _reactor() -> Any:

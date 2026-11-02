@@ -23,7 +23,7 @@ from zuno_calls.backends.cloudflare.sfu import ROUTES, SFUHandler
 from zuno_calls.config import CloudflareConfig
 from zuno_calls.ratelimit import RateLimiter
 from zuno_calls.removal import Removals, RemoveHandler
-from zuno_calls.resource import Call, ZunoResource
+from zuno_calls.resource import Call, ZunoResource, match
 from zuno_calls.upstream import NO_RETRY, UpstreamUnavailable
 
 CFG = CloudflareConfig(
@@ -100,10 +100,14 @@ async def open_session(handler, upstream, session_id="abc", user=ALICE, query=No
         ("PUT", ["abc", "renegotiate"], "/abc/renegotiate"),
         ("PUT", ["abc", "tracks", "close"], "/abc/tracks/close"),
         ("PUT", ["abc", "tracks", "update"], "/abc/tracks/update"),
+        ("POST", ["abc", "datachannels", "establish"], "/abc/datachannels/establish"),
+        ("POST", ["abc", "datachannels", "new"], "/abc/datachannels/new"),
+        ("PUT", ["abc", "datachannels", "close"], "/abc/datachannels/close"),
     ],
 )
 @pytest_twisted.ensureDeferred
 async def test_each_route_maps_onto_cloudflare(method, segments, suffix):
+    assert match(ROUTES, method, tuple(segments))
     upstream = FakeUpstream()
     handler = make(upstream)
     await open_session(handler, upstream)
@@ -152,12 +156,21 @@ async def test_bad_session_id_is_400(bad):
     assert upstream.calls == []
 
 
+@pytest.mark.parametrize(
+    "method, rest",
+    [
+        ("PUT", ["tracks", "close"]),
+        ("POST", ["datachannels", "establish"]),
+        ("POST", ["datachannels", "new"]),
+        ("PUT", ["datachannels", "close"]),
+    ],
+)
 @pytest_twisted.ensureDeferred
-async def test_another_users_session_is_404():
+async def test_another_users_session_is_404(method, rest):
     upstream = FakeUpstream()
     handler = make(upstream)
     await open_session(handler, upstream)
-    mallory = call("PUT", ["abc", "tracks", "close"], user="@mallory:zuno.chat")
+    mallory = call(method, ["abc", *rest], user="@mallory:zuno.chat")
     await expect_error(handler, mallory, 404, Codes.NOT_FOUND)
     assert upstream.calls == []
 
@@ -466,6 +479,9 @@ async def test_a_removed_person_may_open_in_another_call():
         ("PUT", ["renegotiate"]),
         ("PUT", ["tracks", "close"]),
         ("PUT", ["tracks", "update"]),
+        ("POST", ["datachannels", "establish"]),
+        ("POST", ["datachannels", "new"]),
+        ("PUT", ["datachannels", "close"]),
     ],
 )
 @pytest_twisted.ensureDeferred
@@ -518,14 +534,13 @@ async def test_a_track_outside_the_call_is_refused_per_track(remote):
     reply = await handler(pull("b", (remote, "video")))
     assert upstream.calls == []
     assert json.loads(reply.body) == {
-        "requiresImmediateRenegotiation": False,
         "tracks": [
             {
                 "location": "remote",
                 "sessionId": remote,
                 "trackName": "video",
                 "errorCode": "IM.ZUNO.TRACK_NOT_IN_CALL",
-                "errorDescription": "Track is not in this call",
+                "errorDescription": "Not in this call",
             }
         ],
     }
@@ -569,6 +584,118 @@ async def test_local_tracks_are_relayed_as_sent():
     }
     await handler(call("POST", ["b", "tracks", "new"], json.dumps(push).encode(), user=BOB))
     assert json.loads(upstream.calls[0]["body"]) == push
+
+
+@pytest_twisted.ensureDeferred
+async def test_a_pulls_simulcast_object_is_relayed_untouched():
+    handler, upstream, _ = await removed_from_call()
+    track = {
+        "location": "remote",
+        "sessionId": "a",
+        "trackName": "video",
+        "simulcast": {"preferredRid": "h", "priorityOrdering": "asciibetical"},
+    }
+    body = json.dumps({"tracks": [track]}).encode()
+    await handler(call("POST", ["b", "tracks", "new"], body, user=BOB))
+    assert sent_tracks(upstream) == [track]
+
+
+def subscribe(session_id, *remotes, user=BOB):
+    channels = [
+        {"location": "remote", "sessionId": s, "dataChannelName": "quality"} for s in remotes
+    ]
+    body = json.dumps({"dataChannels": channels}).encode()
+    return call("POST", [session_id, "datachannels", "new"], body, user=user)
+
+
+def sent_channels(upstream):
+    return json.loads(upstream.calls[-1]["body"])["dataChannels"]
+
+
+def granted(*remotes):
+    channels = [
+        {"location": "remote", "sessionId": s, "dataChannelName": "quality", "id": i}
+        for i, s in enumerate(remotes, start=2)
+    ]
+    return {"dataChannels": channels}
+
+
+def refused_channel(remote, errcode, description):
+    return {
+        "location": "remote",
+        "sessionId": remote,
+        "dataChannelName": "quality",
+        "errorCode": errcode,
+        "errorDescription": description,
+    }
+
+
+@pytest_twisted.ensureDeferred
+async def test_establishing_the_data_channel_transport_is_relayed():
+    handler, upstream, _ = await removed_from_call()
+    establish = b'{"dataChannel":{"location":"remote","dataChannelName":"server-events"}}'
+    offer = b'{"sessionDescription":{"type":"offer","sdp":"v=0"},"dataChannel":{"id":0}}'
+    upstream.reply(200, body=offer)
+    reply = await handler(call("POST", ["b", "datachannels", "establish"], establish, user=BOB))
+    assert upstream.calls[0]["body"] == establish
+    assert (reply.status, reply.body) == (200, offer)
+
+
+@pytest_twisted.ensureDeferred
+async def test_publishing_a_data_channel_is_relayed():
+    handler, upstream, _ = await removed_from_call()
+    publish = {"dataChannels": [{"location": "local", "dataChannelName": "quality"}]}
+    await handler(
+        call("POST", ["b", "datachannels", "new"], json.dumps(publish).encode(), user=BOB)
+    )
+    assert json.loads(upstream.calls[0]["body"]) == publish
+
+
+@pytest_twisted.ensureDeferred
+async def test_subscribing_to_a_peers_data_channel_in_the_call_is_relayed():
+    handler, upstream, _ = await removed_from_call()
+    upstream.reply(200, body=json.dumps(granted("a")).encode())
+    reply = await handler(subscribe("b", "a"))
+    assert sent_channels(upstream) == [
+        {"location": "remote", "sessionId": "a", "dataChannelName": "quality"}
+    ]
+    assert json.loads(reply.body) == granted("a")
+
+
+@pytest.mark.parametrize("remote", ["a2", "unknown"])
+@pytest_twisted.ensureDeferred
+async def test_a_data_channel_outside_the_call_is_refused_per_channel(remote):
+    handler, upstream, _ = await removed_from_call()
+    await open_session(handler, upstream, "a2", ALICE, OTHER_CALL)
+    upstream.reply(200, body=json.dumps(granted("a")).encode())
+    reply = await handler(subscribe("b", remote, "a"))
+    assert [c["sessionId"] for c in sent_channels(upstream)] == ["a"]
+    assert json.loads(reply.body)["dataChannels"] == [
+        refused_channel(remote, "IM.ZUNO.TRACK_NOT_IN_CALL", "Not in this call"),
+        *granted("a")["dataChannels"],
+    ]
+
+
+@pytest_twisted.ensureDeferred
+async def test_a_removed_persons_data_channel_is_refused_per_channel():
+    handler, upstream, _ = await removed_from_call()
+    before = refusals("datachannels/new", "channel")
+    reply = await handler(subscribe("b", "m"))
+    assert upstream.calls == []
+    assert (reply.status, json.loads(reply.body)) == (
+        200,
+        {"dataChannels": [refused_channel("m", "IM.ZUNO.CALL_REMOVED", "Removed from this call")]},
+    )
+    assert refusals("datachannels/new", "channel") - before == 1
+
+
+@pytest.mark.parametrize("query", [OTHER_CALL, None])
+@pytest_twisted.ensureDeferred
+async def test_a_removed_person_subscribing_to_the_call_from_any_session_is_refused(query):
+    handler, upstream, _ = await removed_from_call()
+    await open_session(handler, upstream, "m2", MALLORY, query)
+    await expect_removed(handler, subscribe("m2", "b", user=MALLORY))
+    assert upstream.calls == []
 
 
 @pytest.mark.parametrize("body", [b"not json", b"[]", b'"tracks"'])
@@ -662,6 +789,58 @@ async def test_a_removal_force_closes_the_targets_tracks_in_the_call():
     }
 
 
+def channel(id, status="active", **named):
+    return {"dataChannelName": "quality", "id": id, "status": status, **named}
+
+
+@pytest_twisted.ensureDeferred
+async def test_a_removal_closes_the_targets_data_channels_in_the_call():
+    upstream = FakeUpstream()
+    handler, _, api = await removed_from_call(upstream)
+    await open_session(handler, upstream, "mu", MALLORY)
+    server_events = {"location": "remote", "dataChannelName": "server-events", "id": 0}
+    upstream.reply(
+        200,
+        body=json.dumps(
+            {
+                "tracks": [{"location": "local", "mid": "0", "status": "active"}],
+                "dataChannels": [
+                    {**server_events, "status": "active"},
+                    channel(1, location="local"),
+                    channel(2, location="remote", sessionId="a"),
+                    channel(3, "inactive", location="remote", sessionId="b"),
+                ],
+            }
+        ).encode(),
+    )
+    upstream.reply(200, body=b'{"tracks":[{"mid":"0"}]}')
+    upstream.reply(200, body=b'{"dataChannels":[{"id":0},{"id":1},{"id":2}]}')
+    upstream.reply(
+        200,
+        body=json.dumps(
+            {
+                "dataChannels": [
+                    {**server_events, "status": "active"},
+                    channel(1, location="remote", sessionId="a"),
+                ]
+            }
+        ).encode(),
+    )
+    upstream.reply(200, body=b'{"dataChannels":[{"id":1}]}')
+    assert (await remover(handler, api)(removing())).status == 200
+    assert requests(upstream) == [
+        ("GET", "m"),
+        ("PUT", "m/tracks/close"),
+        ("PUT", "m/datachannels/close"),
+        ("GET", "mu"),
+        ("PUT", "mu/datachannels/close"),
+    ]
+    assert json.loads(upstream.calls[2]["body"]) == {
+        "dataChannels": [{"id": 0}, {"id": 1}, {"id": 2}]
+    }
+    assert json.loads(upstream.calls[4]["body"]) == {"dataChannels": [{"id": 1}]}
+
+
 @pytest.mark.parametrize("status", [404, 400])
 @pytest_twisted.ensureDeferred
 async def test_a_session_cloudflare_no_longer_knows_needs_no_close(status):
@@ -709,6 +888,7 @@ async def test_a_removal_waits_out_the_targets_request_in_flight():
 
 
 ACTIVE = state({"location": "local", "mid": "0", "trackName": "audio", "status": "active"})
+OPEN_CHANNEL = json.dumps({"dataChannels": [channel(1, location="local")]}).encode()
 
 
 @pytest.mark.parametrize(
@@ -725,6 +905,11 @@ ACTIVE = state({"location": "local", "mid": "0", "trackName": "audio", "status":
         [(200, ACTIVE), UpstreamUnavailable("timeout")],
         [UpstreamUnavailable("connect")],
         [(429, b"{}")],
+        [(200, b'{"tracks":[],"dataChannels":"x"}')],
+        [(200, OPEN_CHANNEL), (500, b"{}")],
+        [(200, OPEN_CHANNEL), (200, b'{"dataChannels":[{"id":1,"errorCode":"internal_error"}]}')],
+        [(200, OPEN_CHANNEL), (200, b'{"dataChannels":[]}')],
+        [(200, OPEN_CHANNEL), (200, b'{"tracks":[{"id":1}]}')],
     ],
 )
 @pytest_twisted.ensureDeferred

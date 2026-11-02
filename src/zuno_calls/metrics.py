@@ -9,7 +9,8 @@ CALL_FULL = Counter("zuno_calls_call_full_total", "Session opens refused because
 REMOVALS = Counter("zuno_calls_removals_total", "Removals from a call that passed the power check")
 REMOVED_REFUSALS = Counter(
     "zuno_calls_removed_refusals_total",
-    "Requests (scope=request) and pulled tracks (scope=track) refused as removed from the call",
+    "Requests (scope=request), pulled tracks (scope=track) and data channels (scope=channel)"
+    " refused as removed from the call",
     ["route", "scope"],
 )
 UPSTREAM_REQUESTS = Counter(
