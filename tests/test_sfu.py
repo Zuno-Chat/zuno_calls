@@ -1056,7 +1056,7 @@ async def test_a_close_that_keeps_failing_is_retried_less_often(monkeypatch):
 
 
 @pytest_twisted.ensureDeferred
-async def test_a_session_forgotten_by_age_during_its_retry_leaves_no_retry_behind(monkeypatch):
+async def test_a_session_aging_out_during_its_retry_goes_with_its_retry(monkeypatch):
     now, wall = [0.0], [NOW_MS]
     handler, upstream = await at_the_cap(
         monkeypatch, clock=lambda: now[0], wall_clock=lambda: wall[0] / 1000

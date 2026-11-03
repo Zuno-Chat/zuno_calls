@@ -332,14 +332,6 @@ class SFUHandler:
     async def sweep(self) -> None:
         if not self._loaded:
             return
-        oldest = int(self._wall_clock() * 1000) - _MAX_SESSION_AGE_MS
-        expired = [s for s, session in self._opened.items() if session.opened_at < oldest]
-        for session_id in expired:
-            self._drop(session_id)
-        if expired:
-            await self._api.run_db_interaction(
-                "zuno_calls_forget_cloudflare_sessions", _forget, expired
-            )
         for user_id in list(self._sessions):
             self._api.run_as_background_process(
                 "zuno_calls_close_cloudflare_sessions", self._close_due, user_id
@@ -350,23 +342,33 @@ class SFUHandler:
             return
         self._closers.add(user_id)
         try:
-            while due := await self._due(user_id):
+            while True:
+                expired, due = await self._due(user_id)
+                if not expired and not due:
+                    return
+                if expired:
+                    await self._drop(expired)
                 for session_id in due:
                     await self._retire(session_id)
         finally:
             self._closers.discard(user_id)
 
-    async def _due(self, user_id: str) -> list[str]:
+    async def _due(self, user_id: str) -> tuple[list[str], list[str]]:
         over = await self._calls_over(user_id)
         mine = self._sessions.get(user_id, [])
-        kept = [s for s in mine if s not in over]
+        oldest = int(self._wall_clock() * 1000) - _MAX_SESSION_AGE_MS
+        expired = [s for s in mine if self._opened[s].opened_at < oldest]
+        kept = [s for s in mine if s not in over and s not in expired]
         excess = set(kept[: max(0, len(kept) - _SESSIONS_PER_USER)])
         now = self._clock()
-        return [
+        due = [
             s
             for s in mine
-            if (s in over or s in excess) and self._retry_at.get(s, (0, now))[1] <= now
+            if (s in over or s in excess)
+            and s not in expired
+            and self._retry_at.get(s, (0, now))[1] <= now
         ]
+        return expired, due
 
     async def _calls_over(self, user_id: str) -> set[str]:
         now_ms = self._wall_clock() * 1000
@@ -385,8 +387,6 @@ class SFUHandler:
         return over
 
     async def _retire(self, session_id: str) -> None:
-        if session_id not in self._opened:
-            return
         self._closing.add(session_id)
         try:
             await self._idle([session_id])
@@ -396,28 +396,25 @@ class SFUHandler:
             return
         finally:
             self._closing.discard(session_id)
-        self._drop(session_id)
-        await self._api.run_db_interaction(
-            "zuno_calls_forget_cloudflare_sessions", _forget, [session_id]
-        )
+        await self._drop([session_id])
 
     def _back_off(self, session_id: str) -> None:
-        if session_id not in self._opened:
-            return
         failures = self._retry_at.get(session_id, (0, 0.0))[0] + 1
         delay = min(_RETRY_SECONDS * 2 ** (failures - 1), _MAX_RETRY_SECONDS)
         self._retry_at[session_id] = (failures, self._clock() + delay)
         _logger.warning("Cloudflare session %s did not close; retrying in %ds", session_id, delay)
 
-    def _drop(self, session_id: str) -> None:
-        session = self._opened.pop(session_id, None)
-        self._retry_at.pop(session_id, None)
-        if session is None:
-            return
-        mine = self._sessions[session.user_id]
-        mine.remove(session_id)
-        if not mine:
-            del self._sessions[session.user_id]
+    async def _drop(self, session_ids: list[str]) -> None:
+        for session_id in session_ids:
+            session = self._opened.pop(session_id)
+            self._retry_at.pop(session_id, None)
+            mine = self._sessions[session.user_id]
+            mine.remove(session_id)
+            if not mine:
+                del self._sessions[session.user_id]
+        await self._api.run_db_interaction(
+            "zuno_calls_forget_cloudflare_sessions", _forget, session_ids
+        )
 
     def _screen(
         self, call: Call, place: Place | None, route: str, pull: _Resource
