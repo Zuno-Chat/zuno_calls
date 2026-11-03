@@ -1,6 +1,6 @@
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import pytest_twisted
@@ -16,7 +16,7 @@ from conftest import (
 )
 from synapse.module_api.errors import Codes, SynapseError
 from twisted.internet import reactor as _reactor
-from twisted.internet.defer import Deferred, ensureDeferred
+from twisted.internet.defer import Deferred, ensureDeferred, succeed
 from twisted.internet.task import deferLater
 
 from zuno_calls.backends.cloudflare.sfu import ROUTES, SFUHandler
@@ -42,17 +42,28 @@ IN_CALL = {"room_id": ROOM, "call_id": CALL_ID}
 reactor: Any = _reactor  # the reactor module has no usable static type
 
 
-def make(upstream, api=None, cap=6, clock=lambda: 0.0, now_ms=NOW_MS):
+def make(upstream, api=None, cap=6, clock=lambda: 0.0, now_ms=NOW_MS, wall_clock=None):
     api = as_api(api or FakeModuleApi())
+    wall_clock = wall_clock or (lambda: now_ms / 1000)
     return SFUHandler(
         CFG,
         as_upstream(upstream),
         api,
         cap,
-        Removals(api, wall_clock=lambda: now_ms / 1000),
+        Removals(api, wall_clock=wall_clock),
         clock=clock,
-        wall_clock=lambda: now_ms / 1000,
+        wall_clock=wall_clock,
     )
+
+
+async def settled(handler):
+    await cast(Any, handler._api).settle()
+
+
+def at_once(handler, c):
+    answer = ensureDeferred(handler(c))
+    assert answer.called
+    return answer
 
 
 def call(
@@ -411,13 +422,13 @@ OTHER_CALL = {"room_id": ROOM, "call_id": "c2"}
 REMOVED = {"errcode": "IM.ZUNO.CALL_REMOVED", "error": "Removed from this call"}
 
 
-def a_call():
+def a_call(expires_ts=LIVE):
     """ROOM, made by ALICE at 100, with ALICE, BOB and MALLORY live in CALL_ID."""
     api = room()
     api.rooms[ROOM][("m.room.create", "")] = FakeEvent({"room_version": "11"}, sender=ALICE)
     api.rooms[ROOM][("m.room.power_levels", "")] = FakeEvent({"users": {ALICE: 100}})
     for user in (ALICE, BOB, MALLORY):
-        in_call(api, user)
+        in_call(api, user, {"call_id": CALL_ID, "device_id": "D", "expires_ts": expires_ts})
     return api
 
 
@@ -955,36 +966,277 @@ async def test_a_removal_waits_only_for_requests_in_flight_when_it_starts():
     assert (await after).status == 200
 
 
-@pytest_twisted.ensureDeferred
-async def test_past_the_cap_the_oldest_session_is_closed_before_it_goes(monkeypatch):
+CLOSED = b'{"tracks":[{"mid":"0"}]}'
+
+
+def opened(session_id):
+    return json.dumps({"sessionId": session_id}).encode()
+
+
+def rows(api):
+    return [r[0] for r in api.db.execute("SELECT session_id FROM zuno_calls_cloudflare_sessions")]
+
+
+async def at_the_cap(monkeypatch, clock=lambda: 0.0, wall_clock=None):
     monkeypatch.setattr("zuno_calls.backends.cloudflare.sfu._SESSIONS_PER_USER", 2)
     upstream = FakeUpstream()
-    handler = make(upstream, a_call())
+    handler = make(upstream, a_call(), clock=clock, wall_clock=wall_clock)
     await open_session(handler, upstream, "m", MALLORY, IN_CALL)
     await open_session(handler, upstream, "mu", MALLORY)
-    upstream.reply(201, body=b'{"sessionId":"m3"}')
+    return handler, upstream
+
+
+def slowed(handler, *gated):
+    upstream = Gated(gates=list(gated))
+    handler._upstream = as_upstream(upstream)
+    return upstream
+
+
+@pytest_twisted.ensureDeferred
+async def test_past_the_cap_the_open_answers_before_the_oldest_closes(monkeypatch):
+    handler, _ = await at_the_cap(monkeypatch)
+    slow: Deferred[None] = Deferred()
+    upstream = slowed(handler, succeed(None), slow)
+    upstream.reply(201, body=opened("m3"))
     upstream.reply(200, body=ACTIVE)
-    upstream.reply(200, body=b'{"tracks":[{"mid":"0"}]}')
-    assert (await handler(call("POST", ["new"], user=MALLORY))).status == 201
+    upstream.reply(200, body=CLOSED)
+    reply = await at_once(handler, call("POST", ["new"], user=MALLORY))
+    assert (reply.status, reply.body) == (201, opened("m3"))
+    assert requests(upstream) == [("POST", "new")]
+    await expect_error(handler, call("GET", ["m"], user=MALLORY), 404, Codes.NOT_FOUND)
+    slow.callback(None)
+    await settled(handler)
     assert requests(upstream) == [("POST", "new"), ("GET", "m"), ("PUT", "m/tracks/close")]
     await expect_error(handler, call("GET", ["m"], user=MALLORY), 404, Codes.NOT_FOUND)
-    fresh = make(FakeUpstream(), handler._api)
-    await fresh._load()
-    assert list(fresh._sessions[MALLORY]) == ["mu", "m3"]
+    assert sorted(rows(handler._api)) == ["m3", "mu"]
 
 
 @pytest_twisted.ensureDeferred
-async def test_an_oldest_session_that_will_not_close_is_kept(monkeypatch):
-    monkeypatch.setattr("zuno_calls.backends.cloudflare.sfu._SESSIONS_PER_USER", 2)
-    upstream = FakeUpstream()
-    handler = make(upstream, a_call())
-    await open_session(handler, upstream, "m", MALLORY, IN_CALL)
-    await open_session(handler, upstream, "mu", MALLORY)
-    upstream.reply(201, body=b'{"sessionId":"m3"}')
+async def test_an_oldest_session_that_will_not_close_is_retried_later(monkeypatch):
+    now = [0.0]
+    handler, upstream = await at_the_cap(monkeypatch, clock=lambda: now[0])
+    upstream.reply(201, body=opened("m3"))
     upstream.reply(503, body=b"{}")
-    assert (await handler(call("POST", ["new"], user=MALLORY))).status == 201
-    assert list(handler._sessions[MALLORY]) == ["m", "mu", "m3"]
+    assert (await at_once(handler, call("POST", ["new"], user=MALLORY))).status == 201
+    await settled(handler)
+    assert sorted(rows(handler._api)) == ["m", "m3", "mu"]
+    upstream.calls.clear()
     assert (await handler(call("GET", ["m"], user=MALLORY))).status == 200
+    upstream.reply(201, body=opened("m4"))
+    assert (await at_once(handler, call("POST", ["new"], user=MALLORY))).status == 201
+    await settled(handler)
+    assert requests(upstream) == [("GET", "m"), ("POST", "new"), ("GET", "mu")]
+    upstream.calls.clear()
+    now[0] = 60.0
+    upstream.reply(200, body=ACTIVE)
+    upstream.reply(200, body=CLOSED)
+    await handler.sweep()
+    await settled(handler)
+    assert requests(upstream) == [("GET", "m"), ("PUT", "m/tracks/close")]
+    assert sorted(rows(handler._api)) == ["m3", "m4"]
+
+
+@pytest_twisted.ensureDeferred
+async def test_a_close_that_keeps_failing_is_retried_less_often(monkeypatch):
+    now = [0.0]
+    handler, upstream = await at_the_cap(monkeypatch, clock=lambda: now[0])
+    upstream.reply(201, body=opened("m3"))
+    upstream.reply(503, body=b"{}")
+    await handler(call("POST", ["new"], user=MALLORY))
+    await settled(handler)
+    upstream.calls.clear()
+    for at, retried in ((59.9, False), (60.0, True), (179.9, False), (180.0, True)):
+        now[0] = at
+        upstream.reply(503, body=b"{}")
+        await handler.sweep()
+        await settled(handler)
+        assert requests(upstream) == ([("GET", "m")] if retried else [])
+        upstream.calls.clear()
+        upstream.replies.clear()
+
+
+@pytest_twisted.ensureDeferred
+async def test_a_session_forgotten_by_age_during_its_retry_leaves_no_retry_behind(monkeypatch):
+    now, wall = [0.0], [NOW_MS]
+    handler, upstream = await at_the_cap(
+        monkeypatch, clock=lambda: now[0], wall_clock=lambda: wall[0] / 1000
+    )
+    upstream.reply(201, body=opened("m3"))
+    upstream.reply(503, body=b"{}")
+    await handler(call("POST", ["new"], user=MALLORY))
+    await settled(handler)
+    held: Deferred[None] = Deferred()
+    upstream = slowed(handler, held)
+    upstream.reply(503, body=b"{}")
+    now[0] = 60.0
+    await handler.sweep()
+    wall[0] = NOW_MS + 7 * 86_400_000 + 1
+    await handler.sweep()
+    held.callback(None)
+    await settled(handler)
+    assert requests(upstream) == [("GET", "m")]
+    assert rows(handler._api) == []
+    assert handler._retry_at == {}
+
+
+@pytest_twisted.ensureDeferred
+async def test_a_background_close_waits_out_the_sessions_request_in_flight(monkeypatch):
+    handler, _ = await at_the_cap(monkeypatch)
+    held: Deferred[None] = Deferred()
+    upstream = slowed(handler, held)
+    upstream.reply(201, body=opened("m3"))
+    upstream.reply()
+    upstream.reply(200, body=ACTIVE)
+    upstream.reply(200, body=CLOSED)
+    in_flight = ensureDeferred(handler(call("POST", ["m", "tracks", "new"], user=MALLORY)))
+    await at_once(handler, call("POST", ["new"], user=MALLORY))
+    await deferLater(reactor, 0.12, lambda: None)
+    assert requests(upstream) == [("POST", "new")]
+    held.callback(None)
+    assert (await in_flight).status == 200
+    await settled(handler)
+    assert requests(upstream) == [
+        ("POST", "new"),
+        ("POST", "m/tracks/new"),
+        ("GET", "m"),
+        ("PUT", "m/tracks/close"),
+    ]
+
+
+@pytest_twisted.ensureDeferred
+async def test_two_opens_while_the_oldest_closes_close_each_session_once(monkeypatch):
+    handler, _ = await at_the_cap(monkeypatch)
+    slow: Deferred[None] = Deferred()
+    upstream = slowed(handler, succeed(None), slow)
+    upstream.reply(201, body=opened("m3"))
+    upstream.reply(201, body=opened("m4"))
+    upstream.reply(200, body=ACTIVE)
+    upstream.reply(200, body=CLOSED)
+    assert (await at_once(handler, call("POST", ["new"], user=MALLORY))).status == 201
+    assert (await at_once(handler, call("POST", ["new"], user=MALLORY))).status == 201
+    slow.callback(None)
+    await settled(handler)
+    assert requests(upstream) == [
+        ("POST", "new"),
+        ("POST", "new"),
+        ("GET", "m"),
+        ("PUT", "m/tracks/close"),
+        ("GET", "mu"),
+    ]
+    assert sorted(rows(handler._api)) == ["m3", "m4"]
+
+
+@pytest_twisted.ensureDeferred
+async def test_a_removal_during_a_background_close_closes_every_session_in_the_call(
+    monkeypatch,
+):
+    handler, _ = await at_the_cap(monkeypatch)
+    slow: Deferred[None] = Deferred()
+    upstream = slowed(handler, succeed(None), slow)
+    upstream.reply(201, body=opened("m3"))
+    upstream.reply(200, body=ACTIVE)
+    upstream.reply(200, body=CLOSED)
+    await at_once(handler, call("POST", ["new"], user=MALLORY))
+    reply = await remover(handler, handler._api)(removing())
+    assert reply.status == 200
+    assert requests(upstream) == [
+        ("POST", "new"),
+        ("GET", "m"),
+        ("PUT", "m/tracks/close"),
+        ("GET", "mu"),
+        ("GET", "m3"),
+    ]
+    slow.callback(None)
+    await settled(handler)
+    assert requests(upstream)[-1] == ("GET", "m")
+    assert sorted(rows(handler._api)) == ["m3", "mu"]
+
+
+LATER = NOW_MS + 86_400_000
+
+
+def entry(expires_ts, call_id=CALL_ID):
+    return {"call_id": call_id, "device_id": "D", "expires_ts": expires_ts}
+
+
+def membership(api, user, content):
+    if content is None:
+        del api.rooms[ROOM][("m.call.member", user)]
+    else:
+        api.rooms[ROOM][("m.call.member", user)] = FakeEvent(content)
+
+
+@pytest.mark.parametrize(
+    "content", [None, {}, {"memberships": []}, {"memberships": [entry(LATER, "other")]}]
+)
+@pytest_twisted.ensureDeferred
+async def test_a_session_whose_call_its_owner_left_is_closed(content):
+    api = a_call(LATER)
+    now = [NOW_MS]
+    upstream = FakeUpstream()
+    handler = make(upstream, api, wall_clock=lambda: now[0] / 1000)
+    await open_session(handler, upstream, "a", ALICE, IN_CALL)
+    await open_session(handler, upstream, "b", BOB, IN_CALL)
+    membership(api, ALICE, content)
+    now[0] = NOW_MS + 60_000
+    upstream.reply(200, body=ACTIVE)
+    upstream.reply(200, body=CLOSED)
+    await handler.sweep()
+    await settled(handler)
+    assert requests(upstream) == [("GET", "a"), ("PUT", "a/tracks/close")]
+    await expect_error(handler, call("GET", ["a"]), 404, Codes.NOT_FOUND)
+    assert rows(api) == ["b"]
+
+
+@pytest.mark.parametrize(
+    "age_ms, content, query",
+    [
+        (59_999, None, IN_CALL),
+        (3_600_000, {"memberships": [entry(LATER)]}, IN_CALL),
+        (3_600_000, {"memberships": [entry(NOW_MS + 60_000)]}, IN_CALL),
+        (3_600_000, None, None),
+    ],
+)
+@pytest_twisted.ensureDeferred
+async def test_a_session_whose_call_its_owner_may_still_be_in_is_kept(age_ms, content, query):
+    api = a_call(LATER)
+    membership(api, ALICE, content)
+    now = [NOW_MS]
+    upstream = FakeUpstream()
+    handler = make(upstream, api, wall_clock=lambda: now[0] / 1000)
+    await open_session(handler, upstream, "a", ALICE, query)
+    now[0] = NOW_MS + age_ms
+    await handler.sweep()
+    await settled(handler)
+    assert upstream.calls == []
+    assert (await handler(call("GET", ["a"]))).status == 200
+
+
+@pytest_twisted.ensureDeferred
+async def test_a_session_past_the_maximum_age_is_forgotten_without_a_restart():
+    api = a_call()
+    now = [NOW_MS]
+    upstream = FakeUpstream()
+    handler = make(upstream, api, wall_clock=lambda: now[0] / 1000)
+    await open_session(handler, upstream, "a", ALICE)
+    now[0] = NOW_MS + 7 * 86_400_000 + 1
+    await handler.sweep()
+    await settled(handler)
+    assert upstream.calls == []
+    await expect_error(handler, call("GET", ["a"]), 404, Codes.NOT_FOUND)
+    assert rows(api) == []
+
+
+@pytest_twisted.ensureDeferred
+async def test_a_process_that_served_no_call_sweeps_nothing():
+    api = a_call()
+    upstream = FakeUpstream()
+    await open_session(make(upstream, api), upstream, "a", ALICE, IN_CALL)
+    idle = make(upstream, api, now_ms=NOW_MS + 8 * 86_400_000)
+    await idle.sweep()
+    await settled(idle)
+    assert upstream.calls == []
+    assert rows(api) == ["a"]
 
 
 @pytest_twisted.ensureDeferred

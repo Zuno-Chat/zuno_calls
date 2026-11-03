@@ -10,6 +10,7 @@ import pytest
 from prometheus_client import REGISTRY
 from synapse.module_api import ModuleApi
 from synapse.module_api.errors import Codes, SynapseError
+from twisted.internet.defer import Deferred, ensureDeferred
 
 from zuno_calls.upstream import NO_RETRY, RetryPolicy, Upstream, UpstreamResponse
 
@@ -48,6 +49,22 @@ class FakeModuleApi:
         self.rooms: dict[str, dict[tuple[str, str], FakeEvent]] = {}
         self.db = sqlite3.connect(":memory:")
         weakref.finalize(self, self.db.close)  # Python 3.13 warns on an unclosed connection
+        self.background: list[Deferred] = []
+        self.looping: list[tuple] = []
+
+    def run_as_background_process(self, desc, func, *args, bg_start_span=True, **kwargs):
+        task = ensureDeferred(func(*args, **kwargs))
+        self.background.append(task)
+        return task
+
+    def looping_background_call(
+        self, f, msec, *args, desc=None, run_on_all_instances=False, **kwargs
+    ):
+        self.looping.append((f, msec, desc, run_on_all_instances))
+
+    async def settle(self) -> None:
+        while self.background:
+            await self.background.pop(0)
 
     async def run_db_interaction(self, desc, func, *args):
         cursor = self.db.cursor()

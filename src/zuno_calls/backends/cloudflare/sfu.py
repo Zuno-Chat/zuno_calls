@@ -12,9 +12,9 @@ blindly retry-safe.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
-from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -52,6 +52,13 @@ class _Resource:
     already_closed: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _Session:
+    user_id: str
+    place: Place | None
+    opened_at: int
+
+
 _TRACKS = _Resource(
     entries="tracks",
     id_key="mid",
@@ -77,6 +84,7 @@ _PULLS: dict[tuple[str, ...], _Resource] = {
     ("datachannels", "new"): _DATA_CHANNELS,
 }
 NOT_IN_CALL = "IM.ZUNO.TRACK_NOT_IN_CALL"
+SWEEP_MS = 30_000
 _DESCRIPTIONS = {CALL_REMOVED: CALL_REMOVED_DESCRIPTION, NOT_IN_CALL: "Not in this call"}
 
 # Cloudflare session ids are 32 hex characters; anything else that reaches the
@@ -87,7 +95,7 @@ _PLAIN_TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # Sessions are in Synapse's database too, so a restart forgets none: a
 # forgotten session would be out of a removal's reach.
 _SESSIONS_PER_USER = 32
-# Older sessions are long dead; their rows go on the next load.
+# Older sessions are long dead.
 _MAX_SESSION_AGE_MS = 7 * 24 * 3600 * 1000
 
 # A joiner's m.call.member lands only after its session opens and its tracks
@@ -98,6 +106,10 @@ _PURGE_FLOOR = 64
 # Closing a session's tracks first waits out its requests already in flight,
 # which could still add one, checking this often.
 _DRAIN_SECONDS = 0.05
+_RETRY_SECONDS = 60.0
+_MAX_RETRY_SECONDS = 3600.0
+
+_logger = logging.getLogger(__name__)
 
 _TABLE = """CREATE TABLE IF NOT EXISTS zuno_calls_cloudflare_sessions (
     session_id TEXT NOT NULL PRIMARY KEY,
@@ -108,26 +120,17 @@ _TABLE = """CREATE TABLE IF NOT EXISTS zuno_calls_cloudflare_sessions (
 )"""
 
 
-def _load(txn: Any, oldest: int) -> list[tuple[str, str, str | None, str | None]]:
+def _load(txn: Any, oldest: int) -> list[tuple[str, str, str | None, str | None, int]]:
     txn.execute(_TABLE)
     txn.execute("DELETE FROM zuno_calls_cloudflare_sessions WHERE opened_at < ?", (oldest,))
     txn.execute(
-        "SELECT session_id, user_id, room_id, call_id FROM zuno_calls_cloudflare_sessions"
-        " ORDER BY opened_at"
+        "SELECT session_id, user_id, room_id, call_id, opened_at"
+        " FROM zuno_calls_cloudflare_sessions ORDER BY opened_at"
     )
     return list(txn.fetchall())
 
 
-def _keep(
-    txn: Any,
-    session_id: str,
-    user_id: str,
-    place: Place | None,
-    now: int,
-    forgotten: list[str],
-) -> None:
-    for old in forgotten:
-        txn.execute("DELETE FROM zuno_calls_cloudflare_sessions WHERE session_id = ?", (old,))
+def _keep(txn: Any, session_id: str, user_id: str, place: Place | None, now: int) -> None:
     room_id, call_id = place or (None, None)
     txn.execute(
         "INSERT INTO zuno_calls_cloudflare_sessions"
@@ -136,22 +139,30 @@ def _keep(
     )
 
 
+def _forget(txn: Any, session_ids: list[str]) -> None:
+    txn.executemany(
+        "DELETE FROM zuno_calls_cloudflare_sessions WHERE session_id = ?",
+        [(s,) for s in session_ids],
+    )
+
+
 def _session_id(body: bytes) -> str | None:
     session_id = (json_object(body) or {}).get("sessionId")
     return session_id if isinstance(session_id, str) else None
 
 
-def _live(content: Mapping[str, Any], call_id: str, now_ms: float) -> bool:
+def _entries(content: Mapping[str, Any], call_id: str) -> list[Mapping[str, Any]]:
     memberships = content.get("memberships")
     # Synapse may hand content over frozen, lists as tuples.
     if not isinstance(memberships, (list, tuple)):
-        return False
+        return []
+    return [m for m in memberships if isinstance(m, Mapping) and m.get("call_id") == call_id]
+
+
+def _live(content: Mapping[str, Any], call_id: str, now_ms: float) -> bool:
     return any(
-        isinstance(m, Mapping)
-        and m.get("call_id") == call_id
-        and isinstance(m.get("expires_ts"), int)
-        and m["expires_ts"] > now_ms
-        for m in memberships
+        isinstance(m.get("expires_ts"), int) and m["expires_ts"] > now_ms
+        for m in _entries(content, call_id)
     )
 
 
@@ -210,10 +221,12 @@ class SFUHandler:
         self._removals = removals
         self._clock = clock
         self._wall_clock = wall_clock
-        self._sessions: dict[str, deque[str]] = {}  # user_id -> sessions opened, newest last
-        # session_id -> (opener, the call it was opened in, None when it named none)
-        self._opened: dict[str, tuple[str, Place | None]] = {}
+        self._sessions: dict[str, list[str]] = {}  # user_id -> sessions opened, newest last
+        self._opened: dict[str, _Session] = {}
         self._loaded = False
+        self._closers: set[str] = set()
+        self._closing: set[str] = set()
+        self._retry_at: dict[str, tuple[int, float]] = {}
         self._busy: dict[str, set[object]] = {}  # session_id -> requests in flight to Cloudflare
         # Opens not yet visible as m.call.member: place -> user_id -> monotonic open time.
         self._reservations: dict[Place, dict[str, float]] = {}
@@ -230,9 +243,10 @@ class SFUHandler:
         session_id = call.segments[0]
         # Call participants learn each other's session ids to pull tracks, so
         # knowing an id proves nothing.
-        opener, place = self._opened.get(session_id, (None, None))
-        if opener != call.user_id:
+        session = self._opened.get(session_id)
+        if session is None or session.user_id != call.user_id or session_id in self._closing:
             raise SynapseError(404, "Unknown session", Codes.NOT_FOUND)
+        place = session.place
         route = "/".join(call.segments[1:]) or "session"
         if self._removals.has(place, call.user_id):
             raise refusal(route)
@@ -284,10 +298,10 @@ class SFUHandler:
         rows = await first_read(self._api, "zuno_calls_load_cloudflare_sessions", _load, oldest)
         if self._loaded:  # a concurrent load got here first; later opens went into its copy
             return
-        for session_id, user_id, room_id, call_id in rows:
-            self._sessions.setdefault(user_id, deque()).append(session_id)
+        for session_id, user_id, room_id, call_id, opened_at in rows:
+            self._sessions.setdefault(user_id, []).append(session_id)
             place = None if room_id is None or call_id is None else (room_id, call_id)
-            self._opened[session_id] = (user_id, place)
+            self._opened[session_id] = _Session(user_id, place, opened_at)
         self._loaded = True
 
     async def _open(self, call: Call) -> Reply:
@@ -302,30 +316,108 @@ class SFUHandler:
             self._release(place, call.user_id)
         elif session_id is not None and session_id not in self._opened:
             await self._keep(session_id, call.user_id, place)
+            self._api.run_as_background_process(
+                "zuno_calls_close_cloudflare_sessions", self._close_due, call.user_id
+            )
         return Reply.relay(response)
 
     async def _keep(self, session_id: str, user_id: str, place: Place | None) -> None:
-        """Remembers a new session; past the cap the user's oldest goes, closed first."""
-        mine = self._sessions.setdefault(user_id, deque())
-        forgotten: list[str] = []
-        while len(mine) >= _SESSIONS_PER_USER:
-            old = mine.popleft()
-            opened = self._opened.pop(old)  # its requests are 404 from here
-            try:
-                await self._idle([old])
-                await self._close(old)
-            except (SynapseError, UpstreamUnavailable):
-                # Kept, over the cap, until a later open closes it.
-                mine.appendleft(old)
-                self._opened[old] = opened
-                break
-            forgotten.append(old)
         now = int(self._wall_clock() * 1000)
         await self._api.run_db_interaction(
-            "zuno_calls_keep_cloudflare_session", _keep, session_id, user_id, place, now, forgotten
+            "zuno_calls_keep_cloudflare_session", _keep, session_id, user_id, place, now
         )
-        mine.append(session_id)
-        self._opened[session_id] = (user_id, place)
+        self._sessions.setdefault(user_id, []).append(session_id)
+        self._opened[session_id] = _Session(user_id, place, now)
+
+    async def sweep(self) -> None:
+        if not self._loaded:
+            return
+        oldest = int(self._wall_clock() * 1000) - _MAX_SESSION_AGE_MS
+        expired = [s for s, session in self._opened.items() if session.opened_at < oldest]
+        for session_id in expired:
+            self._drop(session_id)
+        if expired:
+            await self._api.run_db_interaction(
+                "zuno_calls_forget_cloudflare_sessions", _forget, expired
+            )
+        for user_id in list(self._sessions):
+            self._api.run_as_background_process(
+                "zuno_calls_close_cloudflare_sessions", self._close_due, user_id
+            )
+
+    async def _close_due(self, user_id: str) -> None:
+        if user_id in self._closers:
+            return
+        self._closers.add(user_id)
+        try:
+            while due := await self._due(user_id):
+                for session_id in due:
+                    await self._retire(session_id)
+        finally:
+            self._closers.discard(user_id)
+
+    async def _due(self, user_id: str) -> list[str]:
+        over = await self._calls_over(user_id)
+        mine = self._sessions.get(user_id, [])
+        kept = [s for s in mine if s not in over]
+        excess = set(kept[: max(0, len(kept) - _SESSIONS_PER_USER)])
+        now = self._clock()
+        return [
+            s
+            for s in mine
+            if (s in over or s in excess) and self._retry_at.get(s, (0, now))[1] <= now
+        ]
+
+    async def _calls_over(self, user_id: str) -> set[str]:
+        now_ms = self._wall_clock() * 1000
+        rooms: dict[str, list[tuple[str, str]]] = {}
+        for session_id in self._sessions.get(user_id, []):
+            session = self._opened[session_id]
+            if session.place and now_ms - session.opened_at >= _RESERVATION_SECONDS * 1000:
+                room_id, call_id = session.place
+                rooms.setdefault(room_id, []).append((session_id, call_id))
+        over: set[str] = set()
+        for room_id, sessions in rooms.items():
+            state = await self._api.get_room_state(room_id, [("m.call.member", user_id)])
+            member = state.get(("m.call.member", user_id))
+            content = {} if member is None else member.content
+            over.update(s for s, call_id in sessions if not _entries(content, call_id))
+        return over
+
+    async def _retire(self, session_id: str) -> None:
+        if session_id not in self._opened:
+            return
+        self._closing.add(session_id)
+        try:
+            await self._idle([session_id])
+            await self._close(session_id)
+        except (SynapseError, UpstreamUnavailable):
+            self._back_off(session_id)
+            return
+        finally:
+            self._closing.discard(session_id)
+        self._drop(session_id)
+        await self._api.run_db_interaction(
+            "zuno_calls_forget_cloudflare_sessions", _forget, [session_id]
+        )
+
+    def _back_off(self, session_id: str) -> None:
+        if session_id not in self._opened:
+            return
+        failures = self._retry_at.get(session_id, (0, 0.0))[0] + 1
+        delay = min(_RETRY_SECONDS * 2 ** (failures - 1), _MAX_RETRY_SECONDS)
+        self._retry_at[session_id] = (failures, self._clock() + delay)
+        _logger.warning("Cloudflare session %s did not close; retrying in %ds", session_id, delay)
+
+    def _drop(self, session_id: str) -> None:
+        session = self._opened.pop(session_id, None)
+        self._retry_at.pop(session_id, None)
+        if session is None:
+            return
+        mine = self._sessions[session.user_id]
+        mine.remove(session_id)
+        if not mine:
+            del self._sessions[session.user_id]
 
     def _screen(
         self, call: Call, place: Place | None, route: str, pull: _Resource
@@ -362,13 +454,12 @@ class SFUHandler:
         ):
             return None
         remote = entry.get("sessionId")
-        opener, remote_place = (
-            self._opened.get(remote, (None, None)) if isinstance(remote, str) else (None, None)
-        )
+        pulled = self._opened.get(remote) if isinstance(remote, str) else None
         # Temporary, as the call cap: sessions from app releases up to v1.3.0
         # name no call, so a pull with an unbound side skips the binding check.
-        if opener is None:
+        if pulled is None:
             return NOT_IN_CALL if place else None
+        opener, remote_place = pulled.user_id, pulled.place
         if self._removals.has(remote_place, user_id):
             raise refusal(route)
         if self._removals.has(remote_place or place, opener):
@@ -385,7 +476,7 @@ class SFUHandler:
         ones, those pulled from sessions bound to it.
         """
         await self._load()
-        calls = {s: self._opened[s][1] for s in self._sessions.get(user_id, ())}
+        calls = {s: self._opened[s].place for s in self._sessions.get(user_id, ())}
         sessions = [s for s, call_of in calls.items() if call_of in (place, None)]
         try:
             await self._idle(sessions)
@@ -456,11 +547,8 @@ class SFUHandler:
 
     def _pulls_from(self, entry: Mapping[str, Any], place: Place) -> bool:
         remote = entry.get("sessionId")
-        return (
-            entry.get("location") == "remote"
-            and isinstance(remote, str)
-            and self._opened.get(remote, ("", None))[1] == place
-        )
+        pulled = self._opened.get(remote) if isinstance(remote, str) else None
+        return entry.get("location") == "remote" and pulled is not None and pulled.place == place
 
     async def _take_place(self, call: Call) -> Place | None:
         """Reserve the caller a place in the named call, or refuse it as full or removed."""

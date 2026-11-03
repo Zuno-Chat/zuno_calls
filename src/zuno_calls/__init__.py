@@ -54,6 +54,12 @@ class ZunoCalls:
         api.register_web_resource(
             SFU_PATH, SFUResource(api, limiter, sfu_handler, routes=sfu.ROUTES)
         )
+        api.looping_background_call(
+            sfu_handler.sweep,
+            sfu.SWEEP_MS,
+            desc="zuno_calls_sweep_cloudflare_sessions",
+            run_on_all_instances=True,
+        )
         api.register_web_resource(
             TURN_PATH,
             TurnResource(

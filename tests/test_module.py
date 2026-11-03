@@ -39,6 +39,9 @@ def test_registers_every_resource():
     assert isinstance(remove_res._handler, removal.RemoveHandler)
     assert remove_res._handler._removals is sfu_res._handler._removals
     assert remove_res._handler._cut_offs == (sfu_res._handler.cut_off,)
+    assert api.looping == [
+        (sfu_res._handler.sweep, sfu.SWEEP_MS, "zuno_calls_sweep_cloudflare_sessions", True)
+    ]
 
 
 def test_without_cloudflare_section_nothing_is_registered():

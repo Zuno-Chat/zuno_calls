@@ -28,7 +28,7 @@ The backend is named in the path so a LiveKit backend lands beside it (`.../call
 2. Auth: `api.get_user_by_req`; Synapse's own 401s. Rate key is (user, device), user alone for tokens without a device.
 3. Rate limit: token bucket per key; over is 429 `M_LIMIT_EXCEEDED` with `retry_after_ms`, Cloudflare never called.
 4. SFU path check: every segment `[A-Za-z0-9_-]{1,128}`, else 400 `M_INVALID_PARAM` — every other bad segment.
-5. SFU session owner: a `{sessionId}` must be one this user opened through `sessions/new` on this process, else 404 `M_NOT_FOUND`, the same as a session that never existed. Call participants learn each other's ids to pull tracks, so an id alone proves nothing. Owners are kept, the newest 32 sessions per user, in Synapse's database (table `zuno_calls_cloudflare_sessions`, read once per process and held in memory), so a restart forgets none. A user past 32 loses only their own oldest, and only once its tracks and data channels are closed as in a removal's cut-off: a forgotten session would be out of a cut-off's reach. If that close fails the session is kept, over the cap, until a later open closes it. Sessions older than seven days go on the next load. A session opened naming a call is bound to that `(room_id, call_id)`. Every request on a session bound to a call its owner was removed from is 403 `IM.ZUNO.CALL_REMOVED`.
+5. SFU session owner: a `{sessionId}` must be one this user opened through `sessions/new` and not yet forgotten (see Sessions), else 404 `M_NOT_FOUND`, the same as a session that never existed. Call participants learn each other's ids to pull tracks, so an id alone proves nothing. A session opened naming a call is bound to that `(room_id, call_id)`. Every request on a session bound to a call its owner was removed from is 403 `IM.ZUNO.CALL_REMOVED`.
 6. Call cap, `sessions/new` only: `room_id` must start with `!`, `call_id` be non-empty, both at most 255 characters, else 400 `M_INVALID_PARAM`. The caller must be joined to the room, else 403 `M_FORBIDDEN`. A caller removed from the call is 403 `IM.ZUNO.CALL_REMOVED`, before the cap and never counted in it. Participants are distinct users other than the caller with a live `m.call.member` membership for `call_id` (`expires_ts` later than now) or a reservation; at `max_call_participants` the open is 403 `IM.ZUNO.CALL_FULL` with `max_participants`, Cloudflare never called. Otherwise the caller holds a reservation for 60 s, enough to publish tracks and its own `m.call.member`; a failed open releases it. Counting and reserving happen with no await between them, so two opens racing for the last place cannot both pass. The caller never counts against themselves, so a rejoin always passes. Temporary: an open naming neither `room_id` nor `call_id` (app releases up to v1.3.0) skips this step; once the oldest supported release names the call, a missing one becomes 400 `M_MISSING_PARAM`.
 7. Body: SFU reads up to 256 KB, over is 413 `M_TOO_LARGE`; TURN ignores its body (the TTL is config).
 8. Pulls, `tracks/new`, `tracks/update` (which can point a transceiver at another session's track) and `datachannels/new` (which subscribes to another session's data channel): the body must be a JSON object, else 400 `M_NOT_JSON`, and is relayed as parsed, so Cloudflare pulls exactly what was checked. Each entry of its `tracks[]` or `dataChannels[]` that is not a plain `local` one names the session it pulls from. A pull from a session bound to a call the caller was removed from is 403 `IM.ZUNO.CALL_REMOVED` for the whole request: no honest client makes it. Otherwise a pulled entry is refused on its own, at its place in the list with Cloudflare's per-entry `errorCode`/`errorDescription` shape, when its session belongs to someone removed from the call (`IM.ZUNO.CALL_REMOVED`), or when both sessions are bound and to different calls, or the pulling session is bound and the other unknown to this process (`IM.ZUNO.TRACK_NOT_IN_CALL`, for channels too). The rest go to Cloudflare; when none is left Cloudflare is not called. A per-entry refusal never fails the request, since the app rejoins on a failed pull and calls on without a refused channel. Temporary, with the cap: a pull with an unbound side (app releases up to v1.3.0) skips the binding check, never the removal checks.
@@ -38,6 +38,24 @@ The backend is named in the path so a LiveKit backend lands beside it (`.../call
 Success responses carry no CORS headers, which Synapse adds only to its own error responses; the native app never preflights.
 
 Handlers are `async (Call) -> Reply`; `ZunoResource` is the glue (route, auth, limit, body, relay). Errors are `SynapseError`; `DirectServeJsonResource` renders them and runs handlers under Synapse's logging-context rules. Unsupported verbs are the same miss: the resource overrides Synapse's per-method dispatch, so there is one path and never a 405.
+
+## Sessions
+
+Each session opened through `sessions/new` is kept with its owner, its call and its open time in Synapse's database (table `zuno_calls_cloudflare_sessions`, read once per process and held in memory), so a restart forgets none: a forgotten session is out of a removal's reach.
+
+| A session is forgotten when | Closed first |
+|---|---|
+| It is bound to a call, older than the 60 s reservation, and its owner's `m.call.member` event no longer lists that call | Yes |
+| Its owner holds more than 32 besides those, oldest first | Yes |
+| It is older than seven days | No: it is long dead, and this bounds a session whose close never succeeds |
+
+- Closing is a removal's cut-off on the whole session and runs in the background, so `sessions/new` answers as soon as Cloudflare has opened the session and it is saved.
+- An account's sessions close one at a time, so none is closed twice; each open starts its owner's closes and a periodic sweep starts everyone's.
+- A failed close keeps the session for a retry after a growing wait, and the account's next-oldest goes instead, so a stuck session never slows an open or holds an account over the cap for long.
+- Requests on a session being closed are 404, while a removal still reaches it.
+- An entry that has only expired does not end the call: nobody can refresh while Synapse is down, so counting expiry would cut live calls on a restart.
+- The sweep runs on every process but acts only on one that has served a call request since it started, so a worker never closes the main process's sessions.
+- Unbound sessions (app releases up to v1.3.0) go only by the cap or by age.
 
 ## Removal
 
