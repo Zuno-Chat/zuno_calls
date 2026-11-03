@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
-import weakref
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from io import BytesIO
-from typing import cast
+from typing import ClassVar, cast
 
 import pytest
 from prometheus_client import REGISTRY
@@ -43,12 +43,14 @@ class FakeEvent:
 class FakeModuleApi:
     """The ModuleApi calls the module makes, backed by a token table, room state and SQLite."""
 
+    databases: ClassVar[list[sqlite3.Connection]] = []
+
     def __init__(self) -> None:
         self.tokens = {"tok-alice": ALICE, "tok-alice-2": ALICE_2, "tok-bot": APPSERVICE}
         self.registered: list[tuple[str, object]] = []
         self.rooms: dict[str, dict[tuple[str, str], FakeEvent]] = {}
         self.db = sqlite3.connect(":memory:")
-        weakref.finalize(self, self.db.close)  # Python 3.13 warns on an unclosed connection
+        FakeModuleApi.databases.append(self.db)
         self.background: list[Deferred] = []
         self.looping: list[tuple] = []
 
@@ -97,6 +99,13 @@ class FakeModuleApi:
             return self.tokens[token]
         except KeyError:
             raise SynapseError(401, "Unrecognised access token", Codes.UNKNOWN_TOKEN) from None
+
+
+@pytest.fixture(autouse=True)
+def close_fake_databases() -> Iterator[None]:
+    yield
+    while FakeModuleApi.databases:
+        FakeModuleApi.databases.pop().close()
 
 
 class FakeRequest:
